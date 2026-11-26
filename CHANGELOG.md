@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.2.0] - 2026-11-26
+
+### Added
+
+- **5 New Enterprise Rules (29 total, `PIPE-001`..`PIPE-501`)**:
+  - `PIPE-105`: SPDX dependency license compliance check against configurable denied license families (`AGPL`, `GPL`, `SSPL`, `BUSL` by default).
+  - `PIPE-405`, `PIPE-406`, `PIPE-407`: Native GitLab CI (`.gitlab-ci.yml` / `.gitlab-ci.yaml`) security auditor for insecure privileged `docker:dind` TLS disablement, `curl|sh` scripts, hardcoded sensitive variables or log secret leaks, `:latest` images, and unpinned/unencrypted `include:` templates.
+  - `PIPE-501`: Custom organization regex security policies defined via `custom_rules` in `.pipeguard.yml` with path glob scoping and audit-validated compilation.
+- **6 New Dependency Lockfile & Manifest Formats**: `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, `uv.lock`, `composer.lock` / `composer.json`, and `pom.xml` / `pyproject.toml`, plus SPDX license fields in generated CycloneDX 1.5 SBOMs.
+- **Baseline & PR Diff-Base Gating**: Added `--baseline`, `--write-baseline` (deterministic SHA-256 fingerprints), and `--diff-base <git-ref>` across CLI (`scan-repo`, `scan-secrets`, etc.), MCP tools (`baseline_path`, `diff_base`), and composite `action.yml`.
+- **Managed Git Hook Installer (`install-hook`)**: 10th CLI subcommand to install or cleanly uninstall (`--uninstall`) POSIX `.git/hooks/pre-commit` staged secret checks.
+- **12+ New Secret Provider Signatures**: Azure Storage `AccountKey`, DigitalOcean, Cloudflare, HashiCorp Vault, Databricks, Hugging Face, model inference keys, RubyGems, SendGrid, Twilio, Mailgun, Shopify, Telegram bot tokens, and Slack/Discord webhook URLs.
+
+### Fixed & Improved
+
+- **Parallel Cached OSV.dev Auditor**: Deduplicated `/v1/vulns/<id>` lookups using an 8-worker bounded pool with a 6-hour disk TTL cache (`--cache-dir` / `--no-cache`) and package-matched `fixed_version` extraction, cutting cold online lookup latency roughly 2x and warm queries nearly 3x faster.
+- **Expanded `PIPE-005` Keyword Coverage**: Added `service_token`, `api_token`, `bot_token`, `bearer_token`, `refresh_token`, `session_token`, `jwt_secret`, `webhook_secret`, `session_secret`, `encryption_key`, `master_key`, `hmac_secret`, and `oauth_secret`.
+- **Consistent CLI Flag Parsing**: Reorders flags passed after a positional target path (`raksa-pipeguard scan-repo path --format json`) and rejects unexpected extra positional arguments with exit `1`.
+
 ## [0.1.0] - 2026-11-26
 
 ### Added

@@ -10,39 +10,38 @@
 
 Fast, zero-bloat DevSecOps & CI/CD security gate written in Go (`Layer 4` of the Raksa Security Suite).
 
-`raksa-pipeguard` consolidates pre-commit and pipeline checks into a single `7 MB` static binary and `9.27 MB` distroless container image: parallel secret detection (working tree, staged diff, and Git commit history), multi-ecosystem lockfile and CycloneDX 1.5 SBOM auditing (offline DB or OSV.dev), Dockerfile / Kubernetes / Terraform static linters, GitHub Actions workflow hardening, fail-closed `.pipeguard.yml` waivers, SARIF 2.1.0 reporting, and a 7-tool stdio MCP server.
+`raksa-pipeguard` consolidates pre-commit, PR-diff, and pipeline gates into a single `7.27 MB` static binary and `9.54 MB` distroless container image: parallel secret detection (working tree, staged diff, PR diff-base, and Git commit history), 10-format dependency inventory with SPDX license auditing and CycloneDX 1.5 SBOMs (offline DB + parallel TTL-cached OSV.dev lookups), Dockerfile / Kubernetes / Terraform static linters, GitHub Actions & GitLab CI workflow hardening, custom organization regex policies, deterministic baselines, SARIF 2.1.0 reporting, and a 7-tool stdio MCP server.
 
-## Key Capabilities
+## Key Capabilities (`v0.2.0`)
 
-- **24 Built-In Security Rules (`PIPE-001` through `PIPE-404`)**: Mapped to OWASP CI/CD Top 10, OWASP ASVS, CIS Benchmarks, SLSA, and MITRE D3FEND techniques (`D3-KM`, `D3-SBOM`, `D3-CH`, `D3-NI`, `D3-IV`).
-- **Parallel Secret & Git History Scanner (`PIPE-001`..`PIPE-006`)**: Combines high-precision provider/URI signatures with Shannon entropy scoring, placeholder filtering, safe redaction (`abcd***REDACTED***wxyz`), and `git log` / `git diff --cached` inspection (`GIT_TERMINAL_PROMPT=0`).
-- **Multi-Ecosystem Lockfiles, CycloneDX 1.5 SBOM & OSV Audit (`PIPE-101`..`PIPE-104`)**: Inventories `go.mod`/`go.sum`, `package.json`/`package-lock.json`, `Cargo.toml`/`Cargo.lock`, and `requirements.txt`, exports deterministic CycloneDX 1.5 JSON, and audits against local advisory bundles or `https://api.osv.dev/v1/querybatch`.
+- **29 Built-In Security Rules (`PIPE-001` through `PIPE-501`)**: Mapped to OWASP CI/CD Top 10, OWASP ASVS, CIS Benchmarks, SLSA, SPDX License Compliance, and MITRE D3FEND techniques (`D3-KM`, `D3-SBOM`, `D3-CH`, `D3-NI`, `D3-IV`).
+- **Parallel Secret, Staged & PR Diff-Base Scanner (`PIPE-001`..`PIPE-006`)**: Combines cloud/SaaS/VCS signatures (AWS, GCP, Azure, GitHub, GitLab, npm, PyPI, RubyGems, DigitalOcean, Cloudflare, Vault, Databricks, Hugging Face, Stripe, SendGrid, Twilio, Mailgun, Shopify, Slack/Discord webhooks, Telegram, JWTs, DB URIs) with Shannon entropy scoring, placeholder filtering, safe redaction (`abcd***REDACTED***wxyz`), and `git` inspection (`--staged`, `--diff-base`, `--git-history`, `GIT_TERMINAL_PROMPT=0`).
+- **10 Lockfile/Manifest Formats, CycloneDX 1.5 SBOM, Licenses & Cached OSV (`PIPE-101`..`PIPE-105`)**: Inventories `go.mod`/`go.sum`, `package.json`/`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.toml`/`Cargo.lock`, `requirements.txt`, `pyproject.toml`/`poetry.lock`/`uv.lock`, `composer.json`/`composer.lock`, and `pom.xml`, exports CycloneDX 1.5 JSON with SPDX license metadata, flags prohibited copyleft licenses (`AGPL`/`GPL`/`SSPL`/`BUSL`), and queries `https://api.osv.dev` in parallel (8 workers + 6h disk TTL cache + `fixed_version` extraction).
 - **IaC & Container Hardening Linters (`PIPE-201`..`PIPE-304`)**: Audits multi-stage Dockerfiles (`USER`, pinned base tags, `ENV`/`ARG` secrets, `curl|sh`, `chmod 777`, `EXPOSE 22`/`HEALTHCHECK`), Kubernetes manifests (`privileged`, `hostNetwork`/`hostPID`, `runAsNonRoot`, `allowPrivilegeEscalation`, `capabilities.drop: [ALL]`, `readOnlyRootFilesystem`, limits), and Terraform HCL (public SSH/RDP ingress `0.0.0.0/0`, public S3 ACLs, unencrypted volumes).
-- **GitHub Actions Supply-Chain Auditor (`PIPE-401`..`PIPE-404`)**: Detects `pull_request_target` untrusted PR head checkouts, `${{ github.event.* }}` shell injection inside `run:`, `permissions: write-all` or missing `permissions:`, and unpinned third-party actions or mutable `@main`/`@master` refs.
-- **Fail-Closed `.pipeguard.yml` Policy Engine**: Every rule suppression requires an explicit `reason` and rejects malformed or expired `expires_on` (`YYYY-MM-DD`) dates instead of silently ignoring stale exceptions.
-- **Posture Scoring & Triple Reporting**: Computes a `0-100` posture score (`A+` through `F`) under Raksa Finding Schema v1 (`layer: "devsecops"`), exporting ANSI-sanitized CLI tables, structured JSON, and GitHub Code Scanning SARIF `2.1.0`.
-- **7-Tool Stdio MCP Server**: Exposes every scanner over newline-delimited JSON-RPC 2.0 with a `2 MiB` frame limit for autonomous IDE and agent-driven pipeline remediation.
+- **GitHub Actions & GitLab CI Supply-Chain Auditor (`PIPE-401`..`PIPE-407`)**: Detects `pull_request_target` untrusted PR head checkouts, `${{ github.event.* }}` shell injection inside `run:`, `permissions: write-all` or missing `permissions:`, unpinned third-party actions, privileged `docker:dind` without TLS (`DOCKER_TLS_CERTDIR: ""`), GitLab hardcoded secrets/log leaks, `:latest` images, and unpinned/HTTP remote `include:` templates.
+- **Enterprise Policy, Custom Rules (`PIPE-501`) & Deterministic Baselines**: `.pipeguard.yml` enforces fail-closed waivers (`reason` + future `expires_on`), `denied_licenses`, and regex-validated `custom_rules`, while `--baseline` / `--write-baseline` and `--diff-base` let teams fail CI strictly on newly introduced risks.
+- **Managed Git Pre-Commit Hook (`install-hook`) & 7-Tool Stdio MCP Server**: Installs or uninstalls managed `.git/hooks/pre-commit` secret gates and exposes all scanners over line-bounded (`2 MiB`) JSON-RPC 2.0 MCP stdio.
 
 ## Architecture
 
 ```text
 +-----------------------------------------------------------------------------+
 |                        raksa-pipeguard CLI / MCP / CI                       |
-|   scan-secrets | scan-deps | sbom | scan-iac | scan-ci | scan-repo | mcp    |
+|  scan-secrets | scan-deps | sbom | scan-iac | scan-ci | scan-repo | hook    |
 +-----------------------------------------------------------------------------+
         |                  |                  |                   |
         v                  v                  v                   v
 +---------------+  +---------------+  +---------------+   +---------------+
 | secrets       |  | deps          |  | iac           |   | ciworkflow    |
-| Worker pool   |  | Go/Node/Rust/ |  | Dockerfile,   |   | GitHub Actions|
-| Entropy + git |  | PyPI + CDX1.5 |  | K8s YAML, HCL |   | YAML AST      |
+| Worker pool   |  | 10 formats,   |  | Dockerfile,   |   | GitHub Actions|
+| Diff/Git/Entr |  | CDX1.5 + OSV  |  | K8s YAML, HCL |   | & GitLab CI   |
 +---------------+  +---------------+  +---------------+   +---------------+
         |                  |                  |                   |
         +------------------+--------+---------+-------------------+
                                     |
                                     v
              +---------------------------------------------+
-             | policy (.pipeguard.yml fail-closed waivers) |
+             | policy (waivers, custom_rules, baseline)    |
              | schema (Finding v1 + Posture Score 0-100)   |
              | report (table | json | SARIF 2.1.0)         |
              +---------------------------------------------+
@@ -57,7 +56,7 @@ See [docs/architecture.md](docs/architecture.md) and [docs/threat-model.md](docs
 Requires Go `1.24` or newer (`go 1.24` declared in `go.mod`):
 
 ```bash
-go install github.com/luminariadev/raksa-pipeguard/cmd/raksa-pipeguard@v0.1.0
+go install github.com/luminariadev/raksa-pipeguard/cmd/raksa-pipeguard@v0.2.0
 ```
 
 Or build locally with stripped symbols:
@@ -70,11 +69,11 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o raksa-pipeguard ./cmd/raksa
 
 Download platform binaries and `SHA256SUMS.txt` from the GitHub Releases page (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`).
 
-### Container Image (Distroless Non-Root, 9.27 MB)
+### Container Image (Distroless Non-Root, 9.54 MB)
 
 ```bash
-docker build -t raksa-pipeguard:v0.1.0 .
-docker run --rm -v "$PWD:/workspace:ro" raksa-pipeguard:v0.1.0 scan-repo --path /workspace --format table
+docker build -t raksa-pipeguard:v0.2.0 .
+docker run --rm -v "$PWD:/workspace:ro" raksa-pipeguard:v0.2.0 scan-repo --path /workspace --format table
 ```
 
 ## Quick Start
@@ -83,41 +82,37 @@ docker run --rm -v "$PWD:/workspace:ro" raksa-pipeguard:v0.1.0 scan-repo --path 
 
 ```bash
 # Scan a hardened baseline (exit code 0, score 100/100 A+)
-raksa-pipeguard scan-repo --path testdata/hardened --fail-on low --format table
+raksa-pipeguard scan-repo testdata/hardened --fail-on low --format table
 
-# Scan with offline advisory bundle, waiver policy, and SARIF 2.1.0 output (exit code 2 on breach)
-raksa-pipeguard scan-repo \
-  --path testdata/vulnerable \
-  --offline-db testdata/vulnerable/offline_osv.json \
-  --policy testdata/vulnerable/policy_suppress.yml \
-  --format sarif \
-  --output pipeguard.sarif
+# Record an audited baseline snapshot cleanly
+raksa-pipeguard scan-repo --path . --write-baseline .pipeguard-baseline.json --fail-on none
+
+# Gate pull requests only on newly introduced or modified files vs main
+raksa-pipeguard scan-repo --path . --diff-base origin/main --online --format sarif --output pipeguard.sarif
+
+# Install pre-commit staged secret protection in local repo
+raksa-pipeguard install-hook --path . --fail-on high
 ```
 
 Observed output on `testdata/hardened`:
 
 ```text
-raksa-pipeguard v0.1.0 | layer: devsecops | score: 100/100 (A+) | total: 0 (critical: 0, high: 0, medium: 0, low: 0, info: 0)
+raksa-pipeguard v0.2.0 | layer: devsecops | score: 100/100 (A+) | total: 0 (critical: 0, high: 0, medium: 0, low: 0, info: 0)
 No security findings detected.
 ```
 
-Observed summary on `testdata/vulnerable` with `policy_suppress.yml` (which waives `PIPE-206` with future expiry):
-
-```text
-raksa-pipeguard v0.1.0 | layer: devsecops | score: 0/100 (F) | total: 23 (critical: 4, high: 10, medium: 8, low: 1, info: 0)
-```
-
-### Subcommand Reference
+### Subcommand Reference (10 Subcommands)
 
 | Subcommand | Purpose | Key Flags |
 | --- | --- | --- |
-| `scan-repo` | Run all four DevSecOps scanners, waivers, and posture scoring | `--path`, `--offline-db`, `--online`, `--git-history`, `--policy`, `--format`, `--fail-on`, `--output` |
-| `scan-secrets` | Scan workspace files, staged diff, and Git commit history | `--path`, `--entropy`, `--workers`, `--staged`, `--git-history`, `--format`, `--fail-on` |
-| `scan-deps` | Audit lockfiles/manifests offline or via OSV.dev batch API | `--path`, `--offline-db`, `--online`, `--osv-url`, `--timeout`, `--format`, `--fail-on` |
-| `sbom` | Generate deterministic CycloneDX 1.5 JSON SBOM | `--path`, `--output` |
-| `scan-iac` | Lint Dockerfiles, Kubernetes YAML, and Terraform HCL | `--path`, `--policy`, `--format`, `--fail-on`, `--output` |
-| `scan-ci` | Audit `.github/workflows/*.yml` CI/CD pipelines | `--path`, `--policy`, `--format`, `--fail-on`, `--output` |
-| `rules` | List all 24 `PIPE-*` rules with MITRE D3FEND IDs | `--format` (`table` \| `json`), `--module` (`secrets` \| `deps` \| `iac` \| `ci`) |
+| `scan-repo` | Run all scanners, licenses, custom rules, baseline/diff-base, and posture scoring | `--path`, `--offline-db`, `--online`, `--no-cache`, `--cache-dir`, `--git-history`, `--diff-base`, `--baseline`, `--write-baseline`, `--policy`, `--format`, `--fail-on`, `--output` |
+| `scan-secrets` | Scan workspace files, staged diff, PR diff-base, and Git commit history | `--path`, `--entropy`, `--workers`, `--staged`, `--diff-base`, `--git-history`, `--baseline`, `--format`, `--fail-on` |
+| `scan-deps` | Audit lockfiles/manifests, SPDX licenses, and offline/cached OSV.dev advisories | `--path`, `--offline-db`, `--online`, `--no-cache`, `--cache-dir`, `--osv-url`, `--timeout`, `--baseline`, `--format`, `--fail-on` |
+| `sbom` | Generate deterministic CycloneDX 1.5 JSON SBOM with license metadata | `--path`, `--output` |
+| `scan-iac` | Lint Dockerfiles, Kubernetes YAML, and Terraform HCL | `--path`, `--policy`, `--baseline`, `--format`, `--fail-on`, `--output` |
+| `scan-ci` | Audit GitHub Actions (`.github/workflows/*.yml`) & GitLab CI (`.gitlab-ci.yml`) | `--path`, `--policy`, `--baseline`, `--format`, `--fail-on`, `--output` |
+| `install-hook` | Install or uninstall managed `.git/hooks/pre-commit` secret check | `--path`, `--fail-on`, `--force`, `--uninstall` |
+| `rules` | List all 29 `PIPE-*` rules with MITRE D3FEND IDs | `--format` (`table` \| `json`), `--module` (`secrets` \| `deps` \| `iac` \| `ci` \| `policy`) |
 | `mcp` | Launch stdio JSON-RPC 2.0 MCP server (7 tools) | reads stdin / writes stdout |
 | `version` | Print tool, schema version (`1.0`), and layer (`devsecops`) | `--json` |
 
@@ -126,10 +121,10 @@ raksa-pipeguard v0.1.0 | layer: devsecops | score: 0/100 (F) | total: 23 (critic
 | Exit Code | Meaning |
 | --- | --- |
 | `0` | Clean run or no findings meet/exceed `--fail-on` threshold |
-| `1` | CLI usage, I/O, network, or invalid/expired `.pipeguard.yml` policy error |
-| `2` | Security gate breached (`>= --fail-on` severity finding remains after waivers) |
+| `1` | CLI usage, I/O, network, hook, or invalid/expired `.pipeguard.yml` policy error |
+| `2` | Security gate breached (`>= --fail-on` severity finding remains after waivers/baseline) |
 
-## Rule Catalog (`PIPE-001` to `PIPE-404`)
+## Rule Catalog (`PIPE-001` to `PIPE-501`)
 
 | Rule ID | Module | Default Severity | Standard | MITRE D3FEND | Title |
 | --- | --- | --- | --- | --- | --- |
@@ -143,6 +138,7 @@ raksa-pipeguard v0.1.0 | layer: devsecops | score: 0/100 (F) | total: 23 (critic
 | `PIPE-102` | `deps` | `medium` | OWASP CI/CD-SEC-3 | `D3-SBOM` | Medium or Low OSV/CVE vulnerability in project dependency |
 | `PIPE-103` | `deps` | `medium` | SLSA Build L2 | `D3-SBOM` | Unpinned wildcard, latest, or VCS dependency version |
 | `PIPE-104` | `deps` | `low` | SLSA Build L2 | `D3-SBOM` | Missing dependency lockfile or integrity verification |
+| `PIPE-105` | `deps` | `medium` | SPDX License Compliance | `D3-SBOM` | Prohibited or restricted copyleft dependency license detected |
 | `PIPE-201` | `iac` | `high` | CIS Docker 4.1 | `D3-CH` | Dockerfile runs final stage as root user |
 | `PIPE-202` | `iac` | `medium` | CIS Docker 4.7 | `D3-CH` | Dockerfile base image uses mutable `:latest` or unpinned tag |
 | `PIPE-203` | `iac` | `high` | CIS Docker 4.10 | `D3-KM` | Dockerfile embeds sensitive secret in `ENV` or `ARG` |
@@ -157,26 +153,44 @@ raksa-pipeguard v0.1.0 | layer: devsecops | score: 0/100 (F) | total: 23 (critic
 | `PIPE-402` | `ci` | `critical` | OWASP CI/CD-SEC-4 | `D3-IV` | GitHub Actions workflow interpolates untrusted event expression in shell run |
 | `PIPE-403` | `ci` | `high` | SLSA Build L2 | `D3-CH` | GitHub Actions workflow uses `write-all` or omits explicit permissions |
 | `PIPE-404` | `ci` | `medium` | SLSA Source / Build L3 | `D3-SBOM` | GitHub Actions uses unpinned third-party action or mutable branch reference |
+| `PIPE-405` | `ci` | `critical` | OWASP CI/CD-SEC-4 | `D3-CH` | GitLab CI runs privileged insecure DinD or pipes remote script to shell |
+| `PIPE-406` | `ci` | `high` | OWASP CI/CD-SEC-6 | `D3-KM` | GitLab CI hardcodes sensitive variable or exposes credentials in script logs |
+| `PIPE-407` | `ci` | `medium` | SLSA Build L2 | `D3-SBOM` | GitLab CI uses unpinned `:latest` image or mutable remote include ref |
+| `PIPE-501` | `policy` | `high` | Enterprise Custom Policy | `D3-CH` | Custom organization security policy rule violation detected |
 
-## Fail-Closed Waiver Policy (`.pipeguard.yml`)
+## Enterprise Policy (`.pipeguard.yml`)
 
-`raksa-pipeguard` automatically loads `<target>/.pipeguard.yml` if present, or uses `--policy <file>`. Suppression entries MUST provide `rule_id` and `reason`, and reject invalid or expired `expires_on` dates:
+`raksa-pipeguard` automatically loads `<target>/.pipeguard.yml` if present, or uses `--policy <file>`. Suppressions fail closed without a `reason` or once `expires_on` passes, and custom regex rules are compiled at load time:
 
 ```yaml
 min_severity: low
+
+denied_licenses:
+  - AGPL
+  - GPL
+  - SSPL
+  - BUSL
 
 suppressions:
   - rule_id: "PIPE-206"
     target_contains: "worker/Dockerfile"
     reason: "Queue worker exposes no HTTP port and uses process supervision"
     expires_on: "2027-06-30"
+
+custom_rules:
+  - id: "ORG-REG-001"
+    title: "Disallow unapproved legacy internal container registry"
+    severity: high
+    pattern: "registry\\.legacy\\.internal"
+    path_glob: "*.yml"
+    remediation: "Migrate container image references to ghcr.io/org-verified."
 ```
 
 See [examples/pipeguard-policy.yml](examples/pipeguard-policy.yml).
 
 ## Reusable GitHub Action (`action.yml`)
 
-Add DevSecOps gating and SARIF Code Scanning upload to any repository (see [examples/github-workflow.yml](examples/github-workflow.yml)):
+Add DevSecOps gating, PR diff scoping, and SARIF Code Scanning upload to any repository (see [examples/github-workflow.yml](examples/github-workflow.yml)):
 
 ```yaml
 name: Security Gate
@@ -199,7 +213,7 @@ jobs:
 
       # Pin to the full 40-character release commit SHA in strict SLSA L3 environments.
       - name: Run Raksa PipeGuard Gate
-        uses: luminariadev/raksa-pipeguard@v0.1.0
+        uses: luminariadev/raksa-pipeguard@v0.2.0
         with:
           path: .
           mode: repo
@@ -232,24 +246,26 @@ Connect AI coding assistants or IDE agents directly to `raksa-pipeguard` over st
 Registered MCP tools (7):
 
 1. `pipeguard_list_rules`: Return cataloged `PIPE-*` rules (optionally filtered by module).
-2. `pipeguard_scan_secrets`: Scan workspace files and optional Git commit history for credentials.
-3. `pipeguard_scan_deps`: Audit lockfiles and dependencies using an offline advisory file or live `api.osv.dev`.
-4. `pipeguard_generate_sbom`: Export a deterministic CycloneDX 1.5 JSON SBOM.
+2. `pipeguard_scan_secrets`: Scan workspace files, PR diff-base (`diff_base`), and optional Git commit history.
+3. `pipeguard_scan_deps`: Audit 10 lockfile/manifest formats, SPDX licenses, and offline/TTL-cached `api.osv.dev` advisories.
+4. `pipeguard_generate_sbom`: Export a deterministic CycloneDX 1.5 JSON SBOM with license metadata.
 5. `pipeguard_scan_iac`: Audit Dockerfile, Kubernetes YAML, or Terraform HCL by path or inline snippet.
-6. `pipeguard_scan_ci_workflow`: Audit `.github/workflows/*.yml` files or inline YAML workflows.
-7. `pipeguard_scan_repo`: Run full Layer 4 DevSecOps gate across all modules with policy waivers and score/grade summary.
+6. `pipeguard_scan_ci_workflow`: Audit GitHub Actions (`.github/workflows/*.yml`) and GitLab CI (`.gitlab-ci.yml`) pipelines by path or inline YAML.
+7. `pipeguard_scan_repo`: Run full Layer 4 DevSecOps gate across all modules, custom rules, baseline suppression, PR diff scoping, and posture scoring.
 
-## Measured Performance
+## Measured Performance (`v0.2.0`)
 
-Go microbenchmarks collected on `windows/amd64` (`11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz`) via `go test -run '^$' -bench . -benchmem ./...`:
+Benchmarks measured on `windows/amd64` (`11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz`) against `v0.2.0`:
 
-| Benchmark / Workload | Latency | Memory / Allocs |
+| Benchmark / Workload | Latency | Throughput / Allocations |
 | --- | --- | --- |
-| `BenchmarkGenerateSBOM` | `10,524 ns/op` | `5,675 B/op`, `19 allocs/op` |
-| `BenchmarkScanCI` | `37,599 ns/op` | `20,858 B/op`, `236 allocs/op` |
-| `BenchmarkScanIaC` | `41,032 ns/op` | `21,280 B/op`, `264 allocs/op` |
-| `BenchmarkScanSecrets` | `58,225 ns/op` | `194 B/op`, `1 allocs/op` |
-| Live 9-message MCP stdio session (all 7 tools + `initialize` + `tools/list`) | `22.59 ms` total wall clock | Single cold-started Go binary |
+| `BenchmarkGenerateSBOM` | `9,944 ns/op` | `5,772 B/op`, `19 allocs/op` |
+| `BenchmarkScanGitLabCI` | `33,424 ns/op` | `20,429 B/op`, `205 allocs/op` |
+| `BenchmarkScanCI` | `34,153 ns/op` | `20,853 B/op`, `236 allocs/op` |
+| `BenchmarkScanIaC` | `39,962 ns/op` | `21,280 B/op`, `264 allocs/op` |
+| `BenchmarkScanSecrets` | `111,500 ns/op` | `199 B/op`, `1 allocs/op` |
+| Live `--online` OSV.dev (`testdata/vulnerable`, 12 CVEs w/ `fixed_version`) | Cold: `2,043.1 ms` / Warm cache: `737.7 ms` | 8-worker detail pool + 6h disk TTL cache |
+| Live persistent MCP stdio 50-call burst (`pipeguard_scan_repo`) | `avg 2.50 ms` (`p95 3.38 ms`) | `334.2 scans/sec` (`149.6 ms` total) |
 
 ## Raksa Security Suite
 
@@ -257,7 +273,7 @@ Go microbenchmarks collected on `windows/amd64` (`11th Gen Intel(R) Core(TM) i5-
 | --- | --- | --- | --- |
 | Layer 1 | [`raksa-recon`](https://github.com/luminariadev/raksa-recon) | External Attack Surface & Reconnaissance | Go |
 | Layer 2 | [`raksa-netwatch`](https://github.com/luminariadev/raksa-netwatch) | Host, Firewall & Socket Auditing | Python / Linux |
-| Layer 3 | [`raksa-webshield`](https://github.com/luminariadev/raksa-webshield) | Web & API DAST Scanner, Sidecar WAF & TS SDK | TypeScript |
+| Layer 3 | [`raksa-webshield`](https://github.com/luminariadev/raksa-webshield) | Web & API DAST Scanner, Sidecar WAF & TS SDK | TypeScript / Go |
 | Layer 4 | [`raksa-pipeguard`](https://github.com/luminariadev/raksa-pipeguard) | DevSecOps Secret, SBOM, IaC & CI/CD Gate | Go |
 
 ## License

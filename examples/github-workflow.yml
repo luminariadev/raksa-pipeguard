@@ -16,14 +16,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # For production SLSA L3 / PIPE-404 compliance, pin to the full 40-character commit SHA of the v0.1.0 release.
+      # For production SLSA L3 / PIPE-404 compliance, pin to the full 40-character commit SHA of the v0.2.0 release.
       - name: Run Raksa PipeGuard Gate
-        uses: luminariadev/raksa-pipeguard@v0.1.0
+        uses: luminariadev/raksa-pipeguard@v0.2.0
         with:
           path: .
           mode: repo
           format: sarif
           fail-on: high
+          # Optional for PR-scoped gating against base branch:
+          # diff-base: origin/main
           output: pipeguard.sarif
 
       - name: Upload SARIF to GitHub Code Scanning
