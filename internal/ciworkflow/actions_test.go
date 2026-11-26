@@ -117,3 +117,82 @@ func TestScanPathDiscoversWorkflowsOnly(t *testing.T) {
 		t.Fatalf("expected 1 PIPE-403 finding from .github/workflows/build.yml, got %+v", findings)
 	}
 }
+
+func TestGitLabCIHardenedVsInsecure(t *testing.T) {
+	hardened := `
+stages:
+  - test
+
+image: golang:1.26-alpine3.21
+
+variables:
+  DOCKER_TLS_CERTDIR: "/certs"
+  DEPLOY_TOKEN: "$CI_DEPLOY_TOKEN"
+
+include:
+  - local: "/ci/base.yml"
+  - project: "security/templates"
+    ref: "v1.4.0"
+    file: "/go.yml"
+
+unit_test:
+  stage: test
+  script:
+    - go test -race ./...
+`
+	cleanHits, err := ScanContent(hardened, ".gitlab-ci.yml")
+	if err != nil {
+		t.Fatalf("ScanContent hardened gitlab failed: %v", err)
+	}
+	if len(cleanHits) != 0 {
+		t.Fatalf("expected 0 findings on hardened .gitlab-ci.yml, got %+v", cleanHits)
+	}
+
+	insecure := `
+stages:
+  - build
+
+image: docker:latest
+
+include:
+  - remote: "http://insecure.example.invalid/ci.yml"
+  - project: "external/shared-ci"
+    ref: "main"
+    file: "/pipeline.yml"
+
+variables:
+  DOCKER_TLS_CERTDIR: ""
+  STATIC_DEPLOY_PASSWORD: "SuperHardcodedValue99"
+
+services:
+  - docker:24-dind
+
+build_app:
+  stage: build
+  script:
+    - curl -sSL https://example.invalid/setup.sh | sh
+    - printenv
+`
+	badHits, err := ScanContent(insecure, ".gitlab-ci.yml")
+	if err != nil {
+		t.Fatalf("ScanContent insecure gitlab failed: %v", err)
+	}
+	seen := make(map[string]bool)
+	for _, f := range badHits {
+		seen[f.RuleID] = true
+	}
+	for _, want := range []string{"PIPE-405", "PIPE-406", "PIPE-407"} {
+		if !seen[want] {
+			t.Fatalf("expected rule %s in insecure .gitlab-ci.yml findings, got %v", want, seen)
+		}
+	}
+
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, ".gitlab-ci.yml"), []byte(insecure), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pathHits, err := ScanPath(tmp)
+	if err != nil || len(pathHits) == 0 {
+		t.Fatalf("ScanPath failed to discover .gitlab-ci.yml: hits=%d err=%v", len(pathHits), err)
+	}
+}

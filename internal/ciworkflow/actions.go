@@ -24,7 +24,7 @@ var (
 	trustedOwnerTag = regexp.MustCompile(`^(?:actions|github)/`)
 )
 
-// ScanPath audits GitHub Actions workflow YAML files found under root.
+// ScanPath audits GitHub Actions workflow files and GitLab CI pipeline files found under root.
 func ScanPath(root string) ([]schema.Finding, error) {
 	cleanRoot := filepath.Clean(root)
 	info, err := os.Stat(cleanRoot)
@@ -54,8 +54,13 @@ func ScanPath(root string) ([]schema.Finding, error) {
 				}
 				return nil
 			}
-			ext := strings.ToLower(filepath.Ext(d.Name()))
+			lowerName := strings.ToLower(d.Name())
+			ext := filepath.Ext(lowerName)
 			if ext != ".yml" && ext != ".yaml" {
+				return nil
+			}
+			if lowerName == ".gitlab-ci.yml" || lowerName == ".gitlab-ci.yaml" {
+				files = append(files, path)
 				return nil
 			}
 			rel, relErr := filepath.Rel(cleanRoot, path)
@@ -105,7 +110,7 @@ func ScanPath(root string) ([]schema.Finding, error) {
 	return findings, nil
 }
 
-// ScanContent audits a single GitHub Actions workflow YAML document.
+// ScanContent audits a single GitHub Actions or GitLab CI YAML document.
 func ScanContent(content, target string) ([]schema.Finding, error) {
 	if strings.TrimSpace(content) == "" {
 		return nil, nil
@@ -120,6 +125,9 @@ func ScanContent(content, target string) ([]schema.Finding, error) {
 	}
 
 	root := doc.Content[0]
+	if isGitLabYAML(root, target) {
+		return scanGitLabNode(&doc, target), nil
+	}
 	now := time.Now().UTC()
 	findings := make([]schema.Finding, 0)
 

