@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-artifacts:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            ext: ""
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+          - goos: windows
+            goarch: arm64
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Compile release archive
+        env:
+          TARGET_OS: ${{ matrix.goos }}
+          TARGET_ARCH: ${{ matrix.goarch }}
+          BIN_EXT: ${{ matrix.ext }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG_NAME#v}"
+          OUT_DIR="dist/${TARGET_OS}-${TARGET_ARCH}"
+          mkdir -p "$OUT_DIR" release-assets
+          CGO_ENABLED=0 GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" go build -trimpath \
+            -ldflags="-s -w -X github.com/luminariadev/raksa-pipeguard/internal/schema.Version=${VERSION}" \
+            -o "${OUT_DIR}/raksa-pipeguard${BIN_EXT}" ./cmd/raksa-pipeguard
+          cp README.md LICENSE CHANGELOG.md "$OUT_DIR/"
+
+          if [ "$TARGET_OS" = "windows" ]; then
+            (cd dist && zip -rq "../release-assets/raksa-pipeguard-${TAG_NAME}-${TARGET_OS}-${TARGET_ARCH}.zip" "${TARGET_OS}-${TARGET_ARCH}")
+          else
+            tar -czf "release-assets/raksa-pipeguard-${TAG_NAME}-${TARGET_OS}-${TARGET_ARCH}.tar.gz" -C dist "${TARGET_OS}-${TARGET_ARCH}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: release-assets/*
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd artifacts
+          sha256sum raksa-pipeguard-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update GitHub Release with retry backoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd artifacts
+          for attempt in 1 2 3 4; do
+            if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+              if gh release upload "$TAG_NAME" * --clobber; then
+                exit 0
+              fi
+            else
+              if gh release create "$TAG_NAME" * --title "raksa-pipeguard $TAG_NAME" --generate-notes; then
+                exit 0
+              fi
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "Failed to publish GitHub Release after retries" >&2
+          exit 1

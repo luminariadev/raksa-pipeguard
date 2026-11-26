@@ -1,0 +1,134 @@
+name: "Raksa PipeGuard DevSecOps Gate"
+description: "Audit secrets, dependency SBOMs/OSV CVEs, Dockerfiles, Kubernetes/Terraform IaC, and GitHub Actions workflows."
+author: "luminariadev"
+
+inputs:
+  path:
+    description: "Workspace path to scan"
+    required: false
+    default: "."
+  mode:
+    description: "Scan subcommand: repo, secrets, deps, iac, ci, sbom"
+    required: false
+    default: "repo"
+  format:
+    description: "Output format: table, json, sarif"
+    required: false
+    default: "sarif"
+  fail-on:
+    description: "Minimum severity threshold to fail (exit code 2): critical, high, medium, low, info, none"
+    required: false
+    default: "high"
+  policy:
+    description: "Optional path to .pipeguard.yml waiver policy"
+    required: false
+    default: ""
+  offline-db:
+    description: "Optional path to offline OSV advisory JSON file"
+    required: false
+    default: ""
+  online-osv:
+    description: "Enable live api.osv.dev query during deps/repo scans (true or false)"
+    required: false
+    default: "false"
+  git-history:
+    description: "Number of recent git commits to inspect for leaked secrets (0 disables history scan)"
+    required: false
+    default: "0"
+  output:
+    description: "Output report file path (optional)"
+    required: false
+    default: "raksa-pipeguard.sarif"
+  go-version:
+    description: "Go toolchain version used to compile raksa-pipeguard"
+    required: false
+    default: "1.26"
+
+outputs:
+  report-path:
+    description: "Path to the generated report file"
+    value: ${{ steps.scan.outputs.report_path }}
+  exit-code:
+    description: "Exit code returned by raksa-pipeguard (0=clean, 1=error, 2=threshold breach)"
+    value: ${{ steps.scan.outputs.exit_code }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    - name: Build raksa-pipeguard
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+      run: |
+        cd "$ACTION_DIR"
+        CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/raksa-pipeguard" ./cmd/raksa-pipeguard
+
+    - name: Execute Raksa PipeGuard gate
+      id: scan
+      shell: bash
+      env:
+        PG_PATH: ${{ inputs.path }}
+        PG_MODE: ${{ inputs.mode }}
+        PG_FORMAT: ${{ inputs.format }}
+        PG_FAIL_ON: ${{ inputs.fail-on }}
+        PG_POLICY: ${{ inputs.policy }}
+        PG_OFFLINE_DB: ${{ inputs.offline-db }}
+        PG_ONLINE_OSV: ${{ inputs.online-osv }}
+        PG_GIT_HISTORY: ${{ inputs.git-history }}
+        PG_OUTPUT: ${{ inputs.output }}
+      run: |
+        args=()
+        case "$PG_MODE" in
+          repo)    subcmd="scan-repo" ;;
+          secrets) subcmd="scan-secrets" ;;
+          deps)    subcmd="scan-deps" ;;
+          iac)     subcmd="scan-iac" ;;
+          ci)      subcmd="scan-ci" ;;
+          sbom)    subcmd="sbom" ;;
+          *)
+            echo "Invalid raksa-pipeguard mode: $PG_MODE" >&2
+            exit 1
+            ;;
+        esac
+
+        args+=("$subcmd" "--path" "$PG_PATH")
+        if [ "$subcmd" = "sbom" ]; then
+          out_file="${PG_OUTPUT:-raksa-pipeguard.cdx.json}"
+          args+=("--output" "$out_file")
+        else
+          out_file="$PG_OUTPUT"
+          args+=("--format" "$PG_FORMAT" "--fail-on" "$PG_FAIL_ON")
+          if [ -n "$PG_POLICY" ]; then
+            args+=("--policy" "$PG_POLICY")
+          fi
+          if [ -n "$out_file" ]; then
+            args+=("--output" "$out_file")
+          fi
+          if [ "$subcmd" = "scan-repo" ] || [ "$subcmd" = "scan-deps" ]; then
+            if [ -n "$PG_OFFLINE_DB" ]; then
+              args+=("--offline-db" "$PG_OFFLINE_DB")
+            fi
+            if [ "$PG_ONLINE_OSV" = "true" ]; then
+              args+=("--online")
+            fi
+          fi
+          if [ "$subcmd" = "scan-repo" ] || [ "$subcmd" = "scan-secrets" ]; then
+            if [ -n "$PG_GIT_HISTORY" ] && [ "$PG_GIT_HISTORY" != "0" ]; then
+              args+=("--git-history" "$PG_GIT_HISTORY")
+            fi
+          fi
+        fi
+
+        set +e
+        "$RUNNER_TEMP/raksa-pipeguard" "${args[@]}"
+        rc=$?
+        set -e
+
+        echo "report_path=$out_file" >> "$GITHUB_OUTPUT"
+        echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+        exit "$rc"

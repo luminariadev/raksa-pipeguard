@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-vet:
+    name: Go Format, Vet, Race Tests & Vulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Verify gofmt formatting
+        run: |
+          unformatted=$(gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted Go files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests with race detector
+        run: go test -race -count=1 ./...
+
+      - name: Check Go module vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  self-dogfood:
+    name: PipeGuard Self-Dogfood & Fixture Gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Build static binary
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/raksa-pipeguard ./cmd/raksa-pipeguard
+
+      - name: Dogfood secrets, deps, IaC, and CI gates on repository
+        run: |
+          /tmp/raksa-pipeguard scan-secrets --path cmd --fail-on low --format json
+          /tmp/raksa-pipeguard scan-secrets --path internal --fail-on low --format json
+          /tmp/raksa-pipeguard scan-deps --path go.mod --fail-on low --format json
+          /tmp/raksa-pipeguard scan-iac --path Dockerfile --fail-on low --format json
+          /tmp/raksa-pipeguard scan-ci --path .github/workflows --fail-on low --format json
+
+      - name: Verify hardened fixture scores 100 A+ with exit 0
+        run: |
+          /tmp/raksa-pipeguard scan-repo --path testdata/hardened --fail-on low --format table
+
+      - name: Verify vulnerable fixture breaches gate with exit 2 and valid SARIF
+        run: |
+          set +e
+          /tmp/raksa-pipeguard scan-repo \
+            --path testdata/vulnerable \
+            --offline-db testdata/vulnerable/offline_osv.json \
+            --format sarif \
+            --output /tmp/vulnerable.sarif
+          rc=$?
+          set -e
+          if [ "$rc" -ne 2 ]; then
+            echo "Expected exit code 2 from vulnerable fixture scan, got $rc"
+            exit 1
+          fi
+          grep -q '"version": "2.1.0"' /tmp/vulnerable.sarif
+
+  docker-smoke:
+    name: Distroless Container Build & Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build distroless image
+        run: docker build -t raksa-pipeguard:ci .
+
+      - name: Verify non-root execution inside container
+        run: |
+          docker run --rm raksa-pipeguard:ci version --json
+          docker run --rm raksa-pipeguard:ci rules --format table
+          docker run --rm -v "$PWD/Dockerfile:/scan/Dockerfile:ro" \
+            raksa-pipeguard:ci scan-iac --path /scan/Dockerfile --fail-on low --format json
