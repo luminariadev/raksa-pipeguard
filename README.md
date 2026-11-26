@@ -1,5 +1,13 @@
 # raksa-pipeguard
 
+[![CI](https://github.com/luminariadev/raksa-pipeguard/actions/workflows/ci.yml/badge.svg)](https://github.com/luminariadev/raksa-pipeguard/actions/workflows/ci.yml)
+[![Release](https://github.com/luminariadev/raksa-pipeguard/actions/workflows/release.yml/badge.svg)](https://github.com/luminariadev/raksa-pipeguard/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/go-1.24%2B-00ADD8.svg)](https://go.dev/)
+[![SARIF 2.1.0](https://img.shields.io/badge/SARIF-2.1.0-4c1.svg)](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html)
+[![CycloneDX 1.5](https://img.shields.io/badge/CycloneDX-1.5-2ea44f.svg)](https://cyclonedx.org/)
+[![MCP](https://img.shields.io/badge/MCP-7%20tools-6f42c1.svg)](#mcp-server-integration-raksa-pipeguard-mcp)
+
 Fast, zero-bloat DevSecOps & CI/CD security gate written in Go (`Layer 4` of the Raksa Security Suite).
 
 `raksa-pipeguard` consolidates pre-commit and pipeline checks into a single `7 MB` static binary and `9.27 MB` distroless container image: parallel secret detection (working tree, staged diff, and Git commit history), multi-ecosystem lockfile and CycloneDX 1.5 SBOM auditing (offline DB or OSV.dev), Dockerfile / Kubernetes / Terraform static linters, GitHub Actions workflow hardening, fail-closed `.pipeguard.yml` waivers, SARIF 2.1.0 reporting, and a 7-tool stdio MCP server.
