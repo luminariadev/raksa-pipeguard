@@ -18,10 +18,11 @@ import (
 const MaxWorkflowBytes = 1024 * 1024
 
 var (
-	untrustedExprRe = regexp.MustCompile(`(?i)\$\{\{[^}]*\b(?:github\.event\.(?:issue\.|pull_request\.(?:title|body|head\.)|comment\.|review\.|review_comment\.|discussion\.|commits|head_commit\.|pages|workflow_run\.(?:head_branch|pull_requests)|client_payload)|github\.head_ref)\b[^}]*\}\}`)
-	prHeadCheckout  = regexp.MustCompile(`(?i)(?:github\.event\.pull_request\.head|github\.head_ref|gh\s+pr\s+checkout|pull/\$\{)`)
-	sha40Re         = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
-	trustedOwnerTag = regexp.MustCompile(`^(?:actions|github)/`)
+	untrustedExprRe  = regexp.MustCompile(`(?i)\$\{\{[^}]*\b(?:github\.event\.(?:issue\.|pull_request\.(?:title|body|head\.)|comment\.|review\.|review_comment\.|discussion\.|commits|head_commit\.|pages|workflow_run\.(?:head_branch|pull_requests)|client_payload)|github\.head_ref)\b[^}]*\}\}`)
+	prHeadCheckout   = regexp.MustCompile(`(?i)(?:github\.event\.pull_request\.head|github\.head_ref|gh\s+pr\s+checkout|pull/\$\{)`)
+	githubEnvWriteRe = regexp.MustCompile(`(?i)(?:>>|\btee\s+-a)\s*["']?\$\{?GITHUB_(?:ENV|PATH)\}?["']?`)
+	sha40Re          = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
+	trustedOwnerTag  = regexp.MustCompile(`^(?:actions|github)/`)
 )
 
 // ScanPath audits GitHub Actions workflow files and GitLab CI pipeline files found under root.
@@ -132,6 +133,8 @@ func ScanContent(content, target string) ([]schema.Finding, error) {
 	findings := make([]schema.Finding, 0)
 
 	hasPRTarget, prTargetLine := hasTrigger(root, "pull_request_target")
+	hasWorkflowRun, wfRunLine := hasTrigger(root, "workflow_run")
+	topUntrustedEnv := collectUntrustedEnvVars(mappingValue(root, "env"))
 
 	topPermsNode := mappingValue(root, "permissions")
 	hasTopPerms := topPermsNode != nil
@@ -199,6 +202,8 @@ func ScanContent(content, target string) ([]schema.Finding, error) {
 		if stepsNode == nil || stepsNode.Kind != yaml.SequenceNode {
 			continue
 		}
+		jobUntrustedEnv := collectUntrustedEnvVars(mappingValue(jobMap, "env"))
+		downloadedWorkflowArtifact := false
 		for idx, stepNode := range stepsNode.Content {
 			if stepNode.Kind != yaml.MappingNode {
 				continue
@@ -206,10 +211,14 @@ func ScanContent(content, target string) ([]schema.Finding, error) {
 			usesNode := mappingValue(stepNode, "uses")
 			withNode := mappingValue(stepNode, "with")
 			runNode := mappingValue(stepNode, "run")
+			stepUntrustedEnv := collectUntrustedEnvVars(mappingValue(stepNode, "env"))
 
 			if usesNode != nil && usesNode.Kind == yaml.ScalarNode {
 				if f, ok := checkActionPinning(usesNode.Value, target, jobName, usesNode.Line, now); ok {
 					findings = append(findings, f)
+				}
+				if hasWorkflowRun && strings.HasPrefix(strings.ToLower(strings.TrimSpace(usesNode.Value)), "actions/download-artifact@") {
+					downloadedWorkflowArtifact = true
 				}
 				if hasPRTarget && isCheckoutAction(usesNode.Value) && withNode != nil {
 					if refNode := mappingValue(withNode, "ref"); refNode != nil && prHeadCheckout.MatchString(refNode.Value) {
@@ -230,6 +239,26 @@ func ScanContent(content, target string) ([]schema.Finding, error) {
 				}
 			}
 
+			if withNode != nil {
+				if scriptNode := mappingValue(withNode, "script"); scriptNode != nil && scriptNode.Kind == yaml.ScalarNode {
+					if match := untrustedExprRe.FindString(scriptNode.Value); match != "" {
+						findings = append(findings, schema.NewFinding(
+							"PIPE-402",
+							"ci",
+							schema.SeverityCritical,
+							"Untrusted GitHub event expression interpolated directly in action script",
+							fmt.Sprintf("Job %q embeds %s inside step with.script (line %d), enabling JavaScript/expression injection.", jobName, match, scriptNode.Line),
+							target,
+							map[string]any{"line": scriptNode.Line, "job": jobName, "step": idx + 1, "expression": match},
+							"Pass untrusted event strings through step env variables and read process.env.* instead of ${{ ... }} inside with.script.",
+							"D3-IV",
+							fmt.Sprintf("script-inject-%s-%d", jobName, scriptNode.Line),
+							now,
+						))
+					}
+				}
+			}
+
 			if runNode != nil && runNode.Kind == yaml.ScalarNode {
 				if hasPRTarget && prHeadCheckout.MatchString(runNode.Value) {
 					findings = append(findings, schema.NewFinding(
@@ -243,6 +272,42 @@ func ScanContent(content, target string) ([]schema.Finding, error) {
 						"Use pull_request without privileged secrets, or isolate untrusted PR execution.",
 						"D3-CH",
 						fmt.Sprintf("prtarget-run-%s-%d", jobName, runNode.Line),
+						now,
+					))
+				}
+
+				if hasWorkflowRun && strings.Contains(strings.ToLower(runNode.Value), "gh run download") {
+					downloadedWorkflowArtifact = true
+				} else if hasWorkflowRun && downloadedWorkflowArtifact {
+					findings = append(findings, schema.NewFinding(
+						"PIPE-408",
+						"ci",
+						schema.SeverityHigh,
+						"workflow_run job executes shell step after downloading untrusted artifact",
+						fmt.Sprintf("Job %q (workflow_run line %d) runs shell commands on line %d after downloading artifacts produced by an external workflow.", jobName, wfRunLine, runNode.Line),
+						target,
+						map[string]any{"line": runNode.Line, "job": jobName, "step": idx + 1},
+						"Treat workflow_run artifacts as untrusted data, never execute scripts or binaries inside them without strict checksum/schema validation.",
+						"D3-IV",
+						fmt.Sprintf("wfrun-art-%s-%d", jobName, runNode.Line),
+						now,
+					))
+					// Report once per artifact download sequence to keep findings concise.
+					downloadedWorkflowArtifact = false
+				}
+
+				if writesUntrustedGitHubEnv(runNode.Value, topUntrustedEnv, jobUntrustedEnv, stepUntrustedEnv) {
+					findings = append(findings, schema.NewFinding(
+						"PIPE-408",
+						"ci",
+						schema.SeverityHigh,
+						"Untrusted data written into GITHUB_ENV or GITHUB_PATH",
+						fmt.Sprintf("Job %q writes untrusted event input into GITHUB_ENV/GITHUB_PATH on line %d, enabling runner environment poisoning.", jobName, runNode.Line),
+						target,
+						map[string]any{"line": runNode.Line, "job": jobName, "step": idx + 1},
+						"Sanitize and validate untrusted values (or use bounded step $GITHUB_OUTPUT instead of GITHUB_ENV/GITHUB_PATH).",
+						"D3-IV",
+						fmt.Sprintf("ghenv-write-%s-%d", jobName, runNode.Line),
 						now,
 					))
 				}
@@ -425,4 +490,36 @@ func mappingValue(m *yaml.Node, key string) *yaml.Node {
 		}
 	}
 	return nil
+}
+
+func collectUntrustedEnvVars(envNode *yaml.Node) map[string]struct{} {
+	if envNode == nil || envNode.Kind != yaml.MappingNode {
+		return nil
+	}
+	out := make(map[string]struct{})
+	for i := 0; i+1 < len(envNode.Content); i += 2 {
+		k := strings.TrimSpace(envNode.Content[i].Value)
+		v := envNode.Content[i+1]
+		if k != "" && v.Kind == yaml.ScalarNode && untrustedExprRe.MatchString(v.Value) {
+			out[k] = struct{}{}
+		}
+	}
+	return out
+}
+
+func writesUntrustedGitHubEnv(script string, envMaps ...map[string]struct{}) bool {
+	if !githubEnvWriteRe.MatchString(script) {
+		return false
+	}
+	if untrustedExprRe.MatchString(script) {
+		return true
+	}
+	for _, m := range envMaps {
+		for k := range m {
+			if strings.Contains(script, "$"+k) || strings.Contains(script, "${"+k) {
+				return true
+			}
+		}
+	}
+	return false
 }

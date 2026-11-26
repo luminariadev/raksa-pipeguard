@@ -196,3 +196,57 @@ build_app:
 		t.Fatalf("ScanPath failed to discover .gitlab-ci.yml: hits=%d err=%v", len(pathHits), err)
 	}
 }
+
+func TestGitHubActionsScriptInjectionAndEnvPoisoning(t *testing.T) {
+	scriptVuln := `
+name: Script Injection
+on: [pull_request_target]
+permissions:
+  contents: read
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "${{ github.event.pull_request.title }}";
+            console.log(title);
+      - name: Env poisoning
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "UNTRUSTED=$PR_TITLE" >> "$GITHUB_ENV"
+`
+	hits, err := ScanContent(scriptVuln, ".github/workflows/script.yml")
+	if err != nil {
+		t.Fatalf("ScanContent scriptVuln failed: %v", err)
+	}
+	seen := make(map[string]bool)
+	for _, h := range hits {
+		seen[h.RuleID] = true
+	}
+	if !seen["PIPE-402"] || !seen["PIPE-408"] {
+		t.Fatalf("expected PIPE-402 (github-script) and PIPE-408 (GITHUB_ENV poisoning), got %+v", hits)
+	}
+
+	wfRun := `
+name: Followup
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - run: ./dist/script.sh
+`
+	wfHits, err := ScanContent(wfRun, ".github/workflows/wf-run.yml")
+	if err != nil || len(wfHits) != 1 || wfHits[0].RuleID != "PIPE-408" {
+		t.Fatalf("expected 1 PIPE-408 finding on workflow_run artifact execution, got hits=%+v err=%v", wfHits, err)
+	}
+}
