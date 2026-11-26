@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -15,8 +16,20 @@ import (
 const MaxPolicyBytes = 1024 * 1024
 
 type Policy struct {
-	MinSeverity  schema.Severity `yaml:"min_severity" json:"min_severity"`
-	Suppressions []Suppression   `yaml:"suppressions" json:"suppressions"`
+	MinSeverity    schema.Severity `yaml:"min_severity" json:"min_severity"`
+	DeniedLicenses []string        `yaml:"denied_licenses" json:"denied_licenses"`
+	Suppressions   []Suppression   `yaml:"suppressions" json:"suppressions"`
+	CustomRules    []CustomRule    `yaml:"custom_rules" json:"custom_rules"`
+}
+
+type CustomRule struct {
+	ID          string          `yaml:"id" json:"id"`
+	Title       string          `yaml:"title" json:"title"`
+	Severity    schema.Severity `yaml:"severity" json:"severity"`
+	Pattern     string          `yaml:"pattern" json:"pattern"`
+	PathGlob    string          `yaml:"path_glob" json:"path_glob"`
+	Remediation string          `yaml:"remediation" json:"remediation"`
+	compiled    *regexp.Regexp
 }
 
 type Suppression struct {
@@ -73,6 +86,42 @@ func LoadPolicy(path string) (*Policy, error) {
 			if _, err := time.Parse("2006-01-02", exp); err != nil {
 				return nil, fmt.Errorf("suppression #%d (%s) invalid expires_on %q (expected YYYY-MM-DD)", idx, sup.RuleID, sup.ExpiresOn)
 			}
+		}
+	}
+
+	for idx := range p.CustomRules {
+		r := &p.CustomRules[idx]
+		r.ID = strings.TrimSpace(r.ID)
+		r.Title = strings.TrimSpace(r.Title)
+		r.Pattern = strings.TrimSpace(r.Pattern)
+		r.PathGlob = strings.TrimSpace(r.PathGlob)
+		r.Remediation = strings.TrimSpace(r.Remediation)
+		if r.ID == "" {
+			return nil, fmt.Errorf("custom_rules #%d has empty id", idx)
+		}
+		if r.Title == "" {
+			return nil, fmt.Errorf("custom_rules #%d (%s) has empty title", idx, r.ID)
+		}
+		if r.Pattern == "" {
+			return nil, fmt.Errorf("custom_rules #%d (%s) has empty regex pattern", idx, r.ID)
+		}
+		sev, err := schema.ParseSeverity(string(r.Severity))
+		if err != nil {
+			return nil, fmt.Errorf("custom_rules #%d (%s) severity: %w", idx, r.ID, err)
+		}
+		r.Severity = sev
+		re, err := regexp.Compile(r.Pattern)
+		if err != nil {
+			return nil, fmt.Errorf("custom_rules #%d (%s) invalid regex: %w", idx, r.ID, err)
+		}
+		r.compiled = re
+		if r.PathGlob != "" {
+			if _, err := filepath.Match(r.PathGlob, "sample.txt"); err != nil {
+				return nil, fmt.Errorf("custom_rules #%d (%s) invalid path_glob %q: %w", idx, r.ID, r.PathGlob, err)
+			}
+		}
+		if r.Remediation == "" {
+			r.Remediation = fmt.Sprintf("Remediate custom policy violation %s according to organization guidelines.", r.ID)
 		}
 	}
 
