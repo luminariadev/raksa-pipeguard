@@ -1,0 +1,234 @@
+package schema
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+const (
+	SchemaVersion  = "1.0"
+	ToolName       = "raksa-pipeguard"
+	LayerDevSecOps = "devsecops"
+)
+
+// Version can be overridden at build time via -ldflags "-X github.com/luminariadev/raksa-pipeguard/internal/schema.Version=0.1.0".
+var Version = "0.1.0"
+
+type Severity string
+
+const (
+	SeverityInfo     Severity = "info"
+	SeverityLow      Severity = "low"
+	SeverityMedium   Severity = "medium"
+	SeverityHigh     Severity = "high"
+	SeverityCritical Severity = "critical"
+)
+
+func ParseSeverity(raw string) (Severity, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "critical":
+		return SeverityCritical, nil
+	case "high":
+		return SeverityHigh, nil
+	case "medium":
+		return SeverityMedium, nil
+	case "low":
+		return SeverityLow, nil
+	case "info":
+		return SeverityInfo, nil
+	default:
+		return "", fmt.Errorf("invalid severity %q: expected critical, high, medium, low, or info", raw)
+	}
+}
+
+func (s Severity) Rank() int {
+	switch s {
+	case SeverityInfo:
+		return 1
+	case SeverityLow:
+		return 2
+	case SeverityMedium:
+		return 3
+	case SeverityHigh:
+		return 4
+	case SeverityCritical:
+		return 5
+	default:
+		return 0
+	}
+}
+
+func (s Severity) MeetsThreshold(threshold Severity) bool {
+	if threshold == "" {
+		return false
+	}
+	return s.Rank() >= threshold.Rank()
+}
+
+type Finding struct {
+	ID          string         `json:"id"`
+	RuleID      string         `json:"rule_id"`
+	Module      string         `json:"module"`
+	Layer       string         `json:"layer"`
+	Severity    Severity       `json:"severity"`
+	Title       string         `json:"title"`
+	Description string         `json:"description"`
+	Target      string         `json:"target"`
+	Evidence    map[string]any `json:"evidence,omitempty"`
+	Remediation string         `json:"remediation"`
+	MitreD3FEND string         `json:"mitre_d3fend"`
+	Timestamp   time.Time      `json:"timestamp"`
+}
+
+type Summary struct {
+	Total    int `json:"total"`
+	Critical int `json:"critical"`
+	High     int `json:"high"`
+	Medium   int `json:"medium"`
+	Low      int `json:"low"`
+	Info     int `json:"info"`
+}
+
+type PostureScore struct {
+	Score int    `json:"score"`
+	Grade string `json:"grade"`
+}
+
+type Report struct {
+	SchemaVersion string        `json:"schema_version"`
+	Tool          string        `json:"tool"`
+	Layer         string        `json:"layer"`
+	GeneratedAt   time.Time     `json:"generated_at"`
+	Posture       *PostureScore `json:"posture,omitempty"`
+	Summary       Summary       `json:"summary"`
+	Findings      []Finding     `json:"findings"`
+}
+
+func ComputePosture(findings []Finding) *PostureScore {
+	score := 100
+	for _, f := range findings {
+		switch f.Severity {
+		case SeverityCritical:
+			score -= 30
+		case SeverityHigh:
+			score -= 18
+		case SeverityMedium:
+			score -= 8
+		case SeverityLow:
+			score -= 3
+		case SeverityInfo:
+			// Informational findings do not penalize posture score.
+		}
+	}
+	if score < 0 {
+		score = 0
+	}
+
+	grade := "F"
+	switch {
+	case score >= 95:
+		grade = "A+"
+	case score >= 90:
+		grade = "A"
+	case score >= 80:
+		grade = "B"
+	case score >= 70:
+		grade = "C"
+	case score >= 55:
+		grade = "D"
+	}
+
+	return &PostureScore{
+		Score: score,
+		Grade: grade,
+	}
+}
+
+func NewReport(findings []Finding, generatedAt time.Time) Report {
+	if findings == nil {
+		findings = []Finding{}
+	}
+	sum := Summary{Total: len(findings)}
+	for _, f := range findings {
+		switch f.Severity {
+		case SeverityCritical:
+			sum.Critical++
+		case SeverityHigh:
+			sum.High++
+		case SeverityMedium:
+			sum.Medium++
+		case SeverityLow:
+			sum.Low++
+		case SeverityInfo:
+			sum.Info++
+		}
+	}
+
+	return Report{
+		SchemaVersion: SchemaVersion,
+		Tool:          ToolName,
+		Layer:         LayerDevSecOps,
+		GeneratedAt:   generatedAt.UTC(),
+		Posture:       ComputePosture(findings),
+		Summary:       sum,
+		Findings:      findings,
+	}
+}
+
+func (r Report) HasThresholdBreach(threshold Severity) bool {
+	if threshold == "" {
+		return false
+	}
+	for _, f := range r.Findings {
+		if f.Severity.MeetsThreshold(threshold) {
+			return true
+		}
+	}
+	return false
+}
+
+func SanitizeIDPart(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' {
+			b.WriteByte(c)
+		} else if c >= 'A' && c <= 'Z' {
+			b.WriteByte(c + ('a' - 'A'))
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func NewFinding(
+	ruleID string,
+	module string,
+	severity Severity,
+	title string,
+	description string,
+	target string,
+	evidence map[string]any,
+	remediation string,
+	d3fend string,
+	idSuffix string,
+	ts time.Time,
+) Finding {
+	return Finding{
+		ID:          fmt.Sprintf("%s-%s", strings.ToLower(ruleID), SanitizeIDPart(idSuffix)),
+		RuleID:      ruleID,
+		Module:      module,
+		Layer:       LayerDevSecOps,
+		Severity:    severity,
+		Title:       title,
+		Description: description,
+		Target:      target,
+		Evidence:    evidence,
+		Remediation: remediation,
+		MitreD3FEND: d3fend,
+		Timestamp:   ts,
+	}
+}
