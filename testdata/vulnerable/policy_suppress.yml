@@ -1,0 +1,5 @@
+suppressions:
+  - rule_id: "PIPE-206"
+    target_contains: "Dockerfile"
+    reason: "Demo waiver for legacy container fixture pending migration to distroless"
+    expires_on: "2027-12-31"

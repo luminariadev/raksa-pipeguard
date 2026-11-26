@@ -1,0 +1,22 @@
+{
+  "vulnerabilities": [
+    {
+      "id": "CVE-2021-23337",
+      "ecosystem": "npm",
+      "package": "lodash",
+      "affected_versions": ["4.17.20"],
+      "severity": "high",
+      "summary": "Command injection vulnerability in lodash template function prior to 4.17.21.",
+      "fixed_version": "4.17.21"
+    },
+    {
+      "id": "CVE-2023-32681",
+      "ecosystem": "PyPI",
+      "package": "requests",
+      "affected_versions": ["2.25.0"],
+      "severity": "medium",
+      "summary": "Unintended leak of Proxy-Authorization header to destination servers in requests prior to 2.31.0.",
+      "fixed_version": "2.31.0"
+    }
+  ]
+}

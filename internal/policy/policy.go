@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -118,4 +119,23 @@ func isSuppressed(f schema.Finding, suppressions []Suppression, todayDate time.T
 		return true
 	}
 	return false
+}
+
+// LoadOptionalPolicy loads explicitPath when provided, or <scanTarget>/.pipeguard.yml if present.
+func LoadOptionalPolicy(scanTarget, explicitPath string) (*Policy, error) {
+	if strings.TrimSpace(explicitPath) != "" {
+		return LoadPolicy(explicitPath)
+	}
+	if strings.TrimSpace(scanTarget) == "" {
+		return nil, nil
+	}
+	baseDir := scanTarget
+	if fi, err := os.Stat(scanTarget); err == nil && !fi.IsDir() {
+		baseDir = filepath.Dir(scanTarget)
+	}
+	candidate := filepath.Join(baseDir, ".pipeguard.yml")
+	if _, err := os.Stat(candidate); err == nil {
+		return LoadPolicy(candidate)
+	}
+	return nil, nil
 }
