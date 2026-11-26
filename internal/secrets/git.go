@@ -3,6 +3,7 @@ package secrets
 import (
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -34,6 +35,47 @@ func ScanGitHistory(repoDir string, maxCommits int, opts ScanOptions) ([]schema.
 		return nil, err
 	}
 	return scanUnifiedDiffOutput(out, "history", opts), nil
+}
+
+// ScanGitDiffBase scans added diff lines between baseRef and HEAD for leaked secrets.
+func ScanGitDiffBase(repoDir, baseRef string, opts ScanOptions) ([]schema.Finding, error) {
+	ref := strings.TrimSpace(baseRef)
+	if ref == "" || strings.HasPrefix(ref, "-") {
+		return nil, fmt.Errorf("invalid diff base ref %q", baseRef)
+	}
+	out, err := runGitDiff(repoDir, []string{"diff", "-U0", "--no-color", ref + "...HEAD"})
+	if err != nil {
+		out, err = runGitDiff(repoDir, []string{"diff", "-U0", "--no-color", ref + "..HEAD"})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return scanUnifiedDiffOutput(out, "diff", opts), nil
+}
+
+// ChangedFilesSince returns slash-normalized relative paths added/copied/modified/renamed since baseRef.
+func ChangedFilesSince(repoDir, baseRef string) (map[string]struct{}, error) {
+	ref := strings.TrimSpace(baseRef)
+	if ref == "" || strings.HasPrefix(ref, "-") {
+		return nil, fmt.Errorf("invalid diff base ref %q", baseRef)
+	}
+	out, err := runGitDiff(repoDir, []string{"diff", "--name-only", "--diff-filter=ACMR", ref + "...HEAD"})
+	if err != nil {
+		out, err = runGitDiff(repoDir, []string{"diff", "--name-only", "--diff-filter=ACMR", ref + "..HEAD"})
+		if err != nil {
+			return nil, err
+		}
+	}
+	changed := make(map[string]struct{})
+	for _, rawLine := range strings.Split(out, "\n") {
+		p := strings.TrimSpace(strings.Trim(rawLine, `"`))
+		if p == "" {
+			continue
+		}
+		p = strings.TrimPrefix(filepath.ToSlash(p), "./")
+		changed[p] = struct{}{}
+	}
+	return changed, nil
 }
 
 func runGitDiff(repoDir string, gitArgs []string) (string, error) {
