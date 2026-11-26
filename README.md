@@ -269,12 +269,14 @@ Benchmarks measured on `windows/amd64` (`11th Gen Intel(R) Core(TM) i5-11400H @ 
 
 ## Raksa Security Suite
 
-| Layer | Repository | Focus | Language |
-| --- | --- | --- | --- |
-| Layer 1 | [`raksa-recon`](https://github.com/luminariadev/raksa-recon) | External Attack Surface & Reconnaissance | Go |
-| Layer 2 | [`raksa-netwatch`](https://github.com/luminariadev/raksa-netwatch) | Host, Firewall & Socket Auditing | Python / Linux |
-| Layer 3 | [`raksa-webshield`](https://github.com/luminariadev/raksa-webshield) | Web & API DAST Scanner, Sidecar WAF & TS SDK | TypeScript / Go |
-| Layer 4 | [`raksa-pipeguard`](https://github.com/luminariadev/raksa-pipeguard) | DevSecOps Secret, SBOM, IaC & CI/CD Gate | Go |
+`raksa-pipeguard` shares **Raksa Finding Schema v1** (`schema_version = "1.0"`) across the modular Raksa ecosystem:
+
+- **Layer 1 (`network-defense`)**: [raksa-netguard](https://github.com/luminariadev/raksa-netguard) (Go) - Exposed port audit and real-time firewall/log anomaly detection.
+- **Layer 2 (`host-hardening`)**: [raksa-hostguard](https://github.com/luminariadev/raksa-hostguard) (Rust) - Signed parallel SHA-256 FIM, Linux/SSH/Docker CIS hardening, and MCP server.
+- **Layer 3 (`web-defense`)**: [raksa-webshield](https://github.com/luminariadev/raksa-webshield) (TypeScript + Go) - Web & API security auditor, semantic SQLi/XSS WAF sidecar, TypeScript SDK, and MCP server.
+- **Layer 4 (`devsecops`)**: `raksa-pipeguard` (Go) - This repository.
+- **Layer 5 (`malware-ioc`, planned)**: `raksa-iocscan` (Python) - YARA, hash reputation, and entropy anomaly scanner.
+- **Layer 6 (`observability-siem`, planned)**: `raksa-siem` (Python + Go) - Log normalizer, correlation engine, and alert router.
 
 ## License
 
