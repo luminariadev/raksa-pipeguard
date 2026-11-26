@@ -195,6 +195,10 @@ var (
 	genericSecretAssignRe = regexp.MustCompile(
 		`(?i)\b([a-z0-9_]*(?:api_key|apikey|api_secret|api_token|secret_key|access_token|auth_token|service_token|bot_token|bearer_token|refresh_token|session_token|app_token|secret_token|jwt_secret|webhook_secret|session_secret|encryption_key|master_key|hmac_secret|oauth_secret|private_key|client_secret|db_password|app_secret|signing_key|password)[a-z0-9_]*)\b\s*[:=]\s*["']?([A-Za-z0-9+/=_-]{16,})["']?`,
 	)
+
+	contextSecretAssignRe = regexp.MustCompile(
+		`(?i)\b([a-z0-9_]*(?:_cred|_credentials|_pass|_passwd|_pwd|_auth|_key|_secret|_token|cred|credentials|passwd))\b\s*[:=]\s*["']?([A-Za-z0-9+/=_-]{20,})["']?`,
+	)
 )
 
 func ScanPath(root string, opts ScanOptions) ([]schema.Finding, error) {
@@ -343,36 +347,93 @@ func ScanContent(content string, target string, opts ScanOptions) []schema.Findi
 			continue
 		}
 
-		if gm := genericSecretAssignRe.FindStringSubmatch(line); len(gm) >= 3 {
-			varName := gm[1]
-			candidate := gm[2]
-			if IsPlaceholderSecret(candidate) || looksLikePureHexDigest(candidate) {
-				continue
-			}
-			ent := ShannonEntropy(candidate)
-			if ent >= threshold {
-				findings = append(findings, schema.NewFinding(
-					"PIPE-005", "secrets", schema.SeverityHigh,
-					"High-entropy generic secret assignment detected",
-					fmt.Sprintf("Assignment to %q on line %d exceeds Shannon entropy threshold %.2f (observed %.2f; value redacted).", varName, lineNo, threshold, ent),
-					target,
-					map[string]any{
-						"line":           lineNo,
-						"variable":       varName,
-						"entropy":        fmt.Sprintf("%.2f", ent),
-						"redacted_match": MaskSecret(candidate),
-						"standard":       "OWASP CI/CD-SEC-6",
-					},
-					fmt.Sprintf("Move %s to encrypted CI secrets or runtime secret manager and rotate the credential.", varName),
-					"D3-KM",
-					fmt.Sprintf("%s-l%d-entropy", filepath.Base(strings.TrimPrefix(target, "file://")), lineNo),
-					now,
-				))
-			}
+		if varName, candidate, ent, ok := detectHighEntropyAssignment(line, target, threshold); ok {
+			findings = append(findings, schema.NewFinding(
+				"PIPE-005", "secrets", schema.SeverityHigh,
+				"High-entropy generic secret assignment detected",
+				fmt.Sprintf("Assignment to %q on line %d exceeds Shannon entropy threshold %.2f (observed %.2f; value redacted).", varName, lineNo, threshold, ent),
+				target,
+				map[string]any{
+					"line":           lineNo,
+					"variable":       varName,
+					"entropy":        fmt.Sprintf("%.2f", ent),
+					"redacted_match": MaskSecret(candidate),
+					"standard":       "OWASP CI/CD-SEC-6",
+				},
+				fmt.Sprintf("Move %s to encrypted CI secrets or runtime secret manager and rotate the credential.", varName),
+				"D3-KM",
+				fmt.Sprintf("%s-l%d-entropy", filepath.Base(strings.TrimPrefix(target, "file://")), lineNo),
+				now,
+			))
 		}
 	}
 
 	return findings
+}
+
+func detectHighEntropyAssignment(line, target string, threshold float64) (string, string, float64, bool) {
+	if gm := genericSecretAssignRe.FindStringSubmatch(line); len(gm) >= 3 {
+		varName := gm[1]
+		candidate := gm[2]
+		if !IsPlaceholderSecret(candidate) && !looksLikePureHexDigest(candidate) {
+			ent := ShannonEntropy(candidate)
+			if ent >= threshold {
+				return varName, candidate, ent, true
+			}
+		}
+	}
+
+	if cm := contextSecretAssignRe.FindStringSubmatch(line); len(cm) >= 3 {
+		varName := cm[1]
+		candidate := cm[2]
+		lowVar := strings.ToLower(varName)
+		strongCredSuffix := strings.HasSuffix(lowVar, "_cred") || strings.HasSuffix(lowVar, "_credentials") ||
+			strings.HasSuffix(lowVar, "_pass") || strings.HasSuffix(lowVar, "_passwd") || strings.HasSuffix(lowVar, "_pwd")
+		if (isConfigOrEnvTarget(target) || strongCredSuffix) &&
+			!IsPlaceholderSecret(candidate) && !looksLikePureHexDigest(candidate) && hasMixedSecretClasses(candidate) {
+			minCtx := threshold
+			if minCtx < 4.3 {
+				minCtx = 4.3
+			}
+			ent := ShannonEntropy(candidate)
+			if ent >= minCtx {
+				return varName, candidate, ent, true
+			}
+		}
+	}
+	return "", "", 0, false
+}
+
+func isConfigOrEnvTarget(target string) bool {
+	base := strings.ToLower(filepath.Base(strings.TrimPrefix(strings.TrimPrefix(target, "file://"), "git://")))
+	if at := strings.IndexByte(base, '@'); at > 0 && strings.HasPrefix(target, "git://") {
+		base = base[:at]
+	}
+	if base == ".env" || strings.HasPrefix(base, ".env.") {
+		return true
+	}
+	switch filepath.Ext(base) {
+	case ".env", ".ini", ".cfg", ".conf", ".properties", ".toml", ".yml", ".yaml", ".json":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasMixedSecretClasses(s string) bool {
+	var hasUpper, hasLower, hasDigitSym bool
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+			hasUpper = true
+		case c >= 'a' && c <= 'z':
+			hasLower = true
+		case (c >= '0' && c <= '9') || strings.IndexByte("+/=_-", c) >= 0:
+			hasDigitSym = true
+		}
+	}
+	return hasUpper && hasLower && hasDigitSym
 }
 
 func readTextForSecrets(path string) (string, bool) {
@@ -408,7 +469,7 @@ func isSkippedSecretDir(name string) bool {
 func isSkippedSecretFile(name string) bool {
 	low := strings.ToLower(name)
 	switch low {
-	case "go.sum", "package-lock.json", "cargo.lock", "yarn.lock", "pnpm-lock.yaml":
+	case "go.sum", "package-lock.json", "cargo.lock", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock", "composer.lock":
 		return true
 	}
 	ext := filepath.Ext(low)

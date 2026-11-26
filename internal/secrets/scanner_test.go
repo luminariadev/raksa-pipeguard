@@ -153,3 +153,20 @@ func TestExpandedKeywordsProvidersAndDiffBase(t *testing.T) {
 		t.Fatalf("expected 1 PIPE-006 diff-base finding, got %+v", diffHits)
 	}
 }
+
+func TestContextAwareGenericCredentialEntropy(t *testing.T) {
+	// Bypass case from v0.2.0 adversarial check: MY_CRED with mixed-class high-entropy value.
+	credVal := "z9K4mQ" + "8wX2pL" + "7vR5nT" + "3yB6jF" + "1dH8sW" + "4cN0eA" + "2qZ7"
+	envDoc := "MY_CRED=" + credVal + "\nCUSTOM_KEY=" + credVal + "\nAPP_NAME=ordinary-lowercase-service-identifier\nHASH_KEY=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+
+	hits := ScanContent(envDoc, "file://.env.local", ScanOptions{})
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 context-aware PIPE-005 hits (MY_CRED and CUSTOM_KEY), got %d: %+v", len(hits), hits)
+	}
+
+	// Non-config Go file with _key identifier without mixed high-entropy classes should avoid false positives.
+	cleanGo := "package cfg\nvar lookup_key = \"ordinary_lowercase_identifier_value\"\n"
+	if cleanHits := ScanContent(cleanGo, "file://cfg.go", ScanOptions{}); len(cleanHits) != 0 {
+		t.Fatalf("expected 0 false positives on non-config single-class value, got %+v", cleanHits)
+	}
+}
