@@ -8,13 +8,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/luminariadev/raksa-pipeguard/internal/ciworkflow"
 	"github.com/luminariadev/raksa-pipeguard/internal/deps"
+	"github.com/luminariadev/raksa-pipeguard/internal/fix"
 	"github.com/luminariadev/raksa-pipeguard/internal/iac"
+	"github.com/luminariadev/raksa-pipeguard/internal/image"
 	"github.com/luminariadev/raksa-pipeguard/internal/policy"
 	"github.com/luminariadev/raksa-pipeguard/internal/report"
 	"github.com/luminariadev/raksa-pipeguard/internal/schema"
@@ -190,7 +194,7 @@ func dispatchRequest(req rpcRequest) rpcResponse {
 	return resp
 }
 
-// ToolDefinitions returns the 7 registered MCP tools.
+// ToolDefinitions returns the 9 registered MCP tools.
 func ToolDefinitions() []toolDefinition {
 	return []toolDefinition{
 		{
@@ -232,24 +236,29 @@ func ToolDefinitions() []toolDefinition {
 				"type":     "object",
 				"required": []string{"path"},
 				"properties": map[string]any{
-					"path":          map[string]any{"type": "string", "description": "Project directory to inspect."},
-					"offline_db":    map[string]any{"type": "string", "description": "Optional local offline OSV advisory JSON file."},
-					"online":        map[string]any{"type": "boolean", "description": "Query live api.osv.dev batch API (default false)."},
-					"no_cache":      map[string]any{"type": "boolean", "description": "Bypass local OSV disk cache when online is true."},
-					"policy_path":   map[string]any{"type": "string", "description": "Optional .pipeguard.yml waiver policy path."},
-					"baseline_path": map[string]any{"type": "string", "description": "Optional baseline JSON path to suppress existing fingerprints."},
+					"path":           map[string]any{"type": "string", "description": "Project directory to inspect."},
+					"offline_db":     map[string]any{"type": "string", "description": "Optional local offline OSV advisory JSON file."},
+					"online":         map[string]any{"type": "boolean", "description": "Query live api.osv.dev batch API (default false)."},
+					"no_cache":       map[string]any{"type": "boolean", "description": "Bypass local OSV/KEV/EPSS disk cache."},
+					"kev_db":         map[string]any{"type": "string", "description": "Optional offline CISA KEV catalog JSON file."},
+					"online_kev":     map[string]any{"type": "boolean", "description": "Fetch cached CISA KEV catalog (default false)."},
+					"online_epss":    map[string]any{"type": "boolean", "description": "Query cached FIRST EPSS API scores (default false)."},
+					"epss_threshold": map[string]any{"type": "number", "description": "EPSS cutoff threshold to upgrade findings to critical PIPE-106 (default 0.50)."},
+					"policy_path":    map[string]any{"type": "string", "description": "Optional .pipeguard.yml waiver policy path."},
+					"baseline_path":  map[string]any{"type": "string", "description": "Optional baseline JSON path to suppress existing fingerprints."},
 				},
 				"additionalProperties": false,
 			},
 		},
 		{
 			Name:        "pipeguard_generate_sbom",
-			Description: "Generate a deterministic CycloneDX 1.5 JSON SBOM from Go, Node, Rust, and Python manifests/lockfiles.",
+			Description: "Generate a deterministic CycloneDX 1.5 or SPDX 2.3 JSON SBOM across Go, Node, Rust, Python, PHP, and Maven lockfiles/manifests.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"path"},
 				"properties": map[string]any{
-					"path": map[string]any{"type": "string", "description": "Project directory to inventory."},
+					"path":   map[string]any{"type": "string", "description": "Project directory to inventory."},
+					"format": map[string]any{"type": "string", "description": "SBOM format: cyclonedx (default) or spdx."},
 				},
 				"additionalProperties": false,
 			},
@@ -296,10 +305,50 @@ func ToolDefinitions() []toolDefinition {
 					"diff_base":           map[string]any{"type": "string", "description": "Optional git base ref to filter findings to changed files plus PR diff secrets."},
 					"offline_db":          map[string]any{"type": "string", "description": "Optional local offline OSV advisory JSON file."},
 					"online":              map[string]any{"type": "boolean", "description": "Query live api.osv.dev batch API (default false)."},
-					"no_cache":            map[string]any{"type": "boolean", "description": "Disable local OSV disk cache when online is true."},
+					"no_cache":            map[string]any{"type": "boolean", "description": "Disable local advisory disk cache."},
+					"kev_db":              map[string]any{"type": "string", "description": "Optional offline CISA KEV catalog JSON file."},
+					"online_kev":          map[string]any{"type": "boolean", "description": "Fetch cached CISA KEV catalog (default false)."},
+					"online_epss":         map[string]any{"type": "boolean", "description": "Query cached FIRST EPSS API scores (default false)."},
+					"epss_threshold":      map[string]any{"type": "number", "description": "EPSS cutoff threshold for PIPE-106 escalation (default 0.50)."},
 					"include_git_history": map[string]any{"type": "boolean", "description": "Scan recent git commits for leaked history secrets."},
 					"git_commits":         map[string]any{"type": "integer", "description": "Max commits when include_git_history is true (default 25)."},
-					"format":              map[string]any{"type": "string", "description": "Output format: json (default), sarif, or table."},
+					"format":              map[string]any{"type": "string", "description": "Output format: json (default), sarif, table, or markdown."},
+				},
+				"additionalProperties": false,
+			},
+		},
+		{
+			Name:        "pipeguard_scan_image",
+			Description: "Inspect a Docker save or OCI layout container tarball without a Docker daemon for root user, Env secrets, Alpine APK / Debian DPKG packages, and OSV/KEV/EPSS vulnerabilities.",
+			InputSchema: map[string]any{
+				"type":     "object",
+				"required": []string{"path"},
+				"properties": map[string]any{
+					"path":           map[string]any{"type": "string", "description": "Container image archive path (.tar or .tar.gz)."},
+					"offline_db":     map[string]any{"type": "string", "description": "Optional local offline OSV advisory JSON file."},
+					"online":         map[string]any{"type": "boolean", "description": "Query live api.osv.dev for extracted OS packages."},
+					"no_cache":       map[string]any{"type": "boolean", "description": "Disable local advisory disk cache."},
+					"kev_db":         map[string]any{"type": "string", "description": "Optional offline CISA KEV catalog JSON file."},
+					"online_kev":     map[string]any{"type": "boolean", "description": "Fetch cached CISA KEV catalog."},
+					"online_epss":    map[string]any{"type": "boolean", "description": "Query cached FIRST EPSS exploit scores."},
+					"epss_threshold": map[string]any{"type": "number", "description": "EPSS cutoff threshold for PIPE-106 escalation (default 0.50)."},
+					"policy_path":    map[string]any{"type": "string", "description": "Optional .pipeguard.yml waiver policy path."},
+					"baseline_path":  map[string]any{"type": "string", "description": "Optional baseline JSON file."},
+					"format":         map[string]any{"type": "string", "description": "Output format: json (default), sarif, table, or markdown."},
+				},
+				"additionalProperties": false,
+			},
+		},
+		{
+			Name:        "pipeguard_suggest_fix",
+			Description: "Generate deterministic hardening patches and unified diffs for Dockerfiles, Kubernetes YAML, and GitHub Actions workflows.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path":    map[string]any{"type": "string", "description": "Path to file to patch."},
+					"content": map[string]any{"type": "string", "description": "Inline manifest/workflow content instead of reading path."},
+					"kind":    map[string]any{"type": "string", "description": "Format kind: dockerfile, kubernetes, or github-actions."},
+					"target":  map[string]any{"type": "string", "description": "Logical target path when using inline content."},
 				},
 				"additionalProperties": false,
 			},
@@ -378,7 +427,7 @@ func executeTool(name string, args map[string]any) toolCallResult {
 		}
 		invFindings = append(invFindings, deps.AuditLicenses(comps, denied)...)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
 		vulnFindings, err := deps.AuditDependencies(ctx, comps, deps.OSVOptions{
 			Online:        getBool(args, "online"),
@@ -386,6 +435,10 @@ func executeTool(name string, args map[string]any) toolCallResult {
 			Timeout:       15 * time.Second,
 			NoCache:       getBool(args, "no_cache"),
 		})
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+		vulnFindings, err = enrichMCPRisk(ctx, vulnFindings, args)
 		if err != nil {
 			return errToolResult(err.Error())
 		}
@@ -401,7 +454,15 @@ func executeTool(name string, args map[string]any) toolCallResult {
 		if err != nil {
 			return errToolResult(err.Error())
 		}
-		sbomJSON, err := deps.GenerateCycloneDX(target, comps)
+		sbomFmt := strings.ToLower(strings.TrimSpace(getString(args, "format")))
+		var sbomJSON string
+		if sbomFmt == "spdx" {
+			sbomJSON, err = deps.GenerateSPDX(target, comps)
+		} else if sbomFmt == "" || sbomFmt == "cyclonedx" || sbomFmt == "cdx" {
+			sbomJSON, err = deps.GenerateCycloneDX(target, comps)
+		} else {
+			return errToolResult(fmt.Sprintf("invalid SBOM format %q: expected cyclonedx or spdx", sbomFmt))
+		}
 		if err != nil {
 			return errToolResult(err.Error())
 		}
@@ -512,7 +573,7 @@ func executeTool(name string, args map[string]any) toolCallResult {
 		}
 		allFindings = append(allFindings, deps.AuditLicenses(comps, denied)...)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
 		vulnFindings, err := deps.AuditDependencies(ctx, comps, deps.OSVOptions{
 			Online:        getBool(args, "online"),
@@ -520,6 +581,10 @@ func executeTool(name string, args map[string]any) toolCallResult {
 			Timeout:       15 * time.Second,
 			NoCache:       getBool(args, "no_cache"),
 		})
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+		vulnFindings, err = enrichMCPRisk(ctx, vulnFindings, args)
 		if err != nil {
 			return errToolResult(err.Error())
 		}
@@ -547,9 +612,114 @@ func executeTool(name string, args map[string]any) toolCallResult {
 
 		return formatToolFindings(allFindings, pol, target, polPath, getString(args, "baseline_path"), diffBase, outFormat)
 
+	case "pipeguard_scan_image":
+		target := getString(args, "path")
+		if target == "" {
+			return errToolResult("missing required argument: path")
+		}
+		formatStr := getString(args, "format")
+		if formatStr == "" {
+			formatStr = "json"
+		}
+		outFormat, err := report.ParseFormat(formatStr)
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+		polPath := getString(args, "policy_path")
+		pol, err := policy.LoadOptionalPolicy(target, polPath)
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+
+		imgRes, err := image.ScanTarball(target)
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+		findings := append([]schema.Finding{}, imgRes.Findings...)
+		var denied []string
+		if pol != nil {
+			denied = pol.DeniedLicenses
+		}
+		findings = append(findings, deps.AuditLicenses(imgRes.Components, denied)...)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		vulnFindings, err := deps.AuditDependencies(ctx, imgRes.Components, deps.OSVOptions{
+			Online:        getBool(args, "online"),
+			OfflineDBPath: getString(args, "offline_db"),
+			Timeout:       15 * time.Second,
+			NoCache:       getBool(args, "no_cache"),
+		})
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+		vulnFindings, err = enrichMCPRisk(ctx, vulnFindings, args)
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+		findings = append(findings, vulnFindings...)
+		return formatToolFindings(findings, pol, target, polPath, getString(args, "baseline_path"), "", outFormat)
+
+	case "pipeguard_suggest_fix":
+		content := getString(args, "content")
+		target := getString(args, "path")
+		kind := getString(args, "kind")
+		logicalTarget := getString(args, "target")
+		if content == "" {
+			if target == "" {
+				return errToolResult("either path or content must be provided")
+			}
+			raw, err := os.ReadFile(target)
+			if err != nil {
+				return errToolResult(err.Error())
+			}
+			content = string(raw)
+			if logicalTarget == "" {
+				logicalTarget = filepath.ToSlash(target)
+			}
+			if kind == "" {
+				low := strings.ToLower(logicalTarget)
+				base := filepath.Base(low)
+				if base == "dockerfile" || strings.HasPrefix(base, "dockerfile.") || strings.HasSuffix(base, ".dockerfile") {
+					kind = "dockerfile"
+				} else if strings.Contains(low, ".github/workflows/") {
+					kind = "github-actions"
+				} else {
+					kind = "kubernetes"
+				}
+			}
+		} else {
+			if kind == "" {
+				return errToolResult("kind (dockerfile, kubernetes, or github-actions) is required when content is provided")
+			}
+			if logicalTarget == "" {
+				logicalTarget = "inline." + kind
+			}
+		}
+		res, err := fix.SuggestFixes(content, kind, logicalTarget)
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+		payload, err := json.MarshalIndent(res, "", "  ")
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+		return okToolResult(string(payload))
+
 	default:
 		return errToolResult(fmt.Sprintf("unknown tool: %s", name))
 	}
+}
+
+func enrichMCPRisk(ctx context.Context, findings []schema.Finding, args map[string]any) ([]schema.Finding, error) {
+	return deps.EnrichFindingsWithRisk(ctx, findings, deps.RiskOptions{
+		KEVPath:       getString(args, "kev_db"),
+		OnlineKEV:     getBool(args, "online_kev"),
+		OnlineEPSS:    getBool(args, "online_epss"),
+		EPSSThreshold: getFloat(args, "epss_threshold", deps.DefaultEPSSThreshold),
+		NoCache:       getBool(args, "no_cache"),
+		Timeout:       15 * time.Second,
+	})
 }
 
 func formatToolFindings(findings []schema.Finding, pol *policy.Policy, scanTarget, explicitPolicy, baselinePath, diffBase string, format report.OutputFormat) toolCallResult {

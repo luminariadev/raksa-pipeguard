@@ -15,7 +15,9 @@ import (
 
 	"github.com/luminariadev/raksa-pipeguard/internal/ciworkflow"
 	"github.com/luminariadev/raksa-pipeguard/internal/deps"
+	"github.com/luminariadev/raksa-pipeguard/internal/fix"
 	"github.com/luminariadev/raksa-pipeguard/internal/iac"
+	"github.com/luminariadev/raksa-pipeguard/internal/image"
 	"github.com/luminariadev/raksa-pipeguard/internal/mcp"
 	"github.com/luminariadev/raksa-pipeguard/internal/policy"
 	"github.com/luminariadev/raksa-pipeguard/internal/report"
@@ -48,14 +50,20 @@ func run(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 		return runScanSecrets(rest, stdout, stderr)
 	case "scan-deps":
 		return runScanDeps(rest, stdout, stderr)
+	case "scan-image":
+		return runScanImage(rest, stdout, stderr)
 	case "sbom":
 		return runSBOM(rest, stdout, stderr)
+	case "sbom-diff":
+		return runSBOMDiff(rest, stdout, stderr)
 	case "scan-iac":
 		return runScanIaC(rest, stdout, stderr)
 	case "scan-ci":
 		return runScanCI(rest, stdout, stderr)
 	case "scan-repo":
 		return runScanRepo(rest, stdout, stderr)
+	case "fix-preview":
+		return runFixPreview(rest, stdout, stderr)
 	case "install-hook":
 		return runInstallHook(rest, stdout, stderr)
 	case "rules":
@@ -83,19 +91,22 @@ Usage:
 
 Subcommands:
   scan-secrets   Scan workspace files, staged changes, PR diff, or git history for secrets
-  scan-deps      Audit lockfiles, dependency licenses, and OSV advisories (cached/offline)
-  sbom           Generate CycloneDX 1.5 JSON SBOM across Go, Node, Rust, Python, PHP, Maven
-  scan-iac       Lint Dockerfiles, Kubernetes YAML manifests, and Terraform HCL files
+  scan-deps      Audit lockfiles, dependency licenses, KEV/EPSS risk, and OSV advisories
+  scan-image     Scan Docker save / OCI tarball OS packages (APK/DPKG) and container runtime config
+  sbom           Generate CycloneDX 1.5 or SPDX 2.3 JSON SBOM across ecosystems
+  sbom-diff      Compare two CycloneDX or SPDX JSON SBOMs for added/removed/changed components
+  scan-iac       Lint Dockerfiles (with ARG resolution), Kubernetes YAML, and multi-cloud Terraform HCL
   scan-ci        Audit GitHub Actions workflows and GitLab CI (.gitlab-ci.yml) pipelines
   scan-repo      Run all Layer 4 checks, custom rules, baseline diffing, and posture scoring
+  fix-preview    Generate deterministic remediation patches and unified diffs (Dockerfile, K8s, GHA)
   install-hook   Install or remove a managed Git pre-commit staged secret-scanning hook
   rules          List built-in PIPE-* security rules and MITRE D3FEND mappings
-  mcp            Start newline-delimited JSON-RPC 2.0 MCP server over stdio (7 tools)
+  mcp            Start newline-delimited JSON-RPC 2.0 MCP server over stdio (9 tools)
   version        Print build version metadata
 
 Common scan flags:
   --path <dir|file>       Target path to scan (default ".")
-  --format <fmt>          Output format: table, json, sarif (default "table")
+  --format <fmt>          Output format: table, json, sarif, markdown (default "table")
   --fail-on <sev>         Minimum severity for exit code 2: critical, high, medium, low, info, none (default "high")
   --policy <file>         Path to .pipeguard.yml waiver & custom rule policy (auto-discovers <path>/.pipeguard.yml)
   --baseline <file>       Suppress known fingerprints recorded in a baseline JSON file
@@ -118,15 +129,29 @@ type commonScanFlags struct {
 	threshold     schema.Severity
 }
 
+type riskFlags struct {
+	kevDB         string
+	onlineKEV     bool
+	onlineEPSS    bool
+	epssThreshold float64
+}
+
 func bindCommonFlags(fs *flag.FlagSet, c *commonScanFlags) {
 	fs.StringVar(&c.path, "path", ".", "target path to inspect")
-	fs.StringVar(&c.format, "format", "table", "output format: table, json, sarif")
+	fs.StringVar(&c.format, "format", "table", "output format: table, json, sarif, markdown")
 	fs.StringVar(&c.failOn, "fail-on", "high", "exit code 2 threshold: critical, high, medium, low, info, none")
 	fs.StringVar(&c.policy, "policy", "", "path to .pipeguard.yml waiver and custom rules file")
 	fs.StringVar(&c.baseline, "baseline", "", "suppress known findings from baseline JSON")
 	fs.StringVar(&c.writeBaseline, "write-baseline", "", "save current findings snapshot to baseline JSON")
 	fs.StringVar(&c.diffBase, "diff-base", "", "scope scan to files changed relative to git ref")
 	fs.StringVar(&c.output, "output", "", "write output report to file path")
+}
+
+func bindRiskFlags(fs *flag.FlagSet, r *riskFlags) {
+	fs.StringVar(&r.kevDB, "kev-db", "", "path to offline CISA KEV catalog JSON")
+	fs.BoolVar(&r.onlineKEV, "online-kev", false, "fetch cached CISA Known Exploited Vulnerabilities catalog")
+	fs.BoolVar(&r.onlineEPSS, "online-epss", false, "query cached FIRST EPSS exploit probabilities for CVEs")
+	fs.Float64Var(&r.epssThreshold, "epss-threshold", deps.DefaultEPSSThreshold, "EPSS score threshold to escalate findings to PIPE-106")
 }
 
 type boolFlagger interface {
@@ -211,6 +236,47 @@ func validateCommonFlags(fs *flag.FlagSet, c *commonScanFlags) error {
 		c.threshold = sev
 	}
 	return nil
+}
+
+func writeTextOrFile(outPath, content string, stdout, stderr io.Writer) int {
+	if strings.TrimSpace(outPath) != "" {
+		if dir := filepath.Dir(outPath); dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				fmt.Fprintf(stderr, "create output directory error: %v\n", err)
+				return exitErr
+			}
+		}
+		if err := os.WriteFile(outPath, []byte(content), 0o644); err != nil {
+			fmt.Fprintf(stderr, "write output file error: %v\n", err)
+			return exitErr
+		}
+		return exitOK
+	}
+	fmt.Fprint(stdout, content)
+	return exitOK
+}
+
+func encodeSBOMByFormat(rootPath string, comps []deps.Component, sbomFormat string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(sbomFormat)) {
+	case "", "cyclonedx", "cdx":
+		return deps.GenerateCycloneDX(rootPath, comps)
+	case "spdx":
+		return deps.GenerateSPDX(rootPath, comps)
+	default:
+		return "", fmt.Errorf("invalid SBOM format %q: expected cyclonedx or spdx", sbomFormat)
+	}
+}
+
+func applyRiskEnrichment(ctx context.Context, findings []schema.Finding, rf riskFlags, cacheDir string, noCache bool, timeoutSec int) ([]schema.Finding, error) {
+	return deps.EnrichFindingsWithRisk(ctx, findings, deps.RiskOptions{
+		KEVPath:       rf.kevDB,
+		OnlineKEV:     rf.onlineKEV,
+		OnlineEPSS:    rf.onlineEPSS,
+		EPSSThreshold: rf.epssThreshold,
+		CacheDir:      cacheDir,
+		NoCache:       noCache,
+		Timeout:       time.Duration(timeoutSec) * time.Second,
+	})
 }
 
 func finalizeScan(findings []schema.Finding, pol *policy.Policy, c commonScanFlags, stdout, stderr io.Writer) int {
@@ -345,6 +411,7 @@ func runScanSecrets(args []string, stdout, stderr io.Writer) int {
 func runScanDeps(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("scan-deps", flag.ContinueOnError)
 	var c commonScanFlags
+	var rf riskFlags
 	var offlineDB string
 	var online bool
 	var osvURL string
@@ -353,12 +420,13 @@ func runScanDeps(args []string, stdout, stderr io.Writer) int {
 	var cacheDir string
 
 	bindCommonFlags(fs, &c)
+	bindRiskFlags(fs, &rf)
 	fs.StringVar(&offlineDB, "offline-db", "", "path to offline OSV advisory JSON file")
 	fs.BoolVar(&online, "online", false, "query live api.osv.dev batch endpoint")
 	fs.StringVar(&osvURL, "osv-url", deps.DefaultOSVBaseURL, "OSV API base URL")
-	fs.IntVar(&timeoutSec, "timeout", 15, "OSV HTTP timeout in seconds")
-	fs.BoolVar(&noCache, "no-cache", false, "disable local OSV disk response cache")
-	fs.StringVar(&cacheDir, "cache-dir", "", "override OSV advisory disk cache directory")
+	fs.IntVar(&timeoutSec, "timeout", 15, "OSV/KEV/EPSS HTTP timeout in seconds")
+	fs.BoolVar(&noCache, "no-cache", false, "disable local OSV/KEV/EPSS disk response cache")
+	fs.StringVar(&cacheDir, "cache-dir", "", "override local advisory disk cache directory")
 
 	if code, ok := parseFlagsWithHelp(fs, args, stdout, stderr); !ok {
 		return code
@@ -386,7 +454,7 @@ func runScanDeps(args []string, stdout, stderr io.Writer) int {
 	}
 	findings = append(findings, deps.AuditLicenses(comps, denied)...)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec+10)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec+15)*time.Second)
 	defer cancel()
 
 	vulnFindings, err := deps.AuditDependencies(ctx, comps, deps.OSVOptions{
@@ -401,15 +469,106 @@ func runScanDeps(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "scan-deps OSV error: %v\n", err)
 		return exitErr
 	}
+	vulnFindings, err = applyRiskEnrichment(ctx, vulnFindings, rf, cacheDir, noCache, timeoutSec)
+	if err != nil {
+		fmt.Fprintf(stderr, "scan-deps risk enrichment error: %v\n", err)
+		return exitErr
+	}
+	findings = append(findings, vulnFindings...)
+	return finalizeScan(findings, pol, c, stdout, stderr)
+}
+
+func runScanImage(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("scan-image", flag.ContinueOnError)
+	var c commonScanFlags
+	var rf riskFlags
+	var offlineDB string
+	var online bool
+	var osvURL string
+	var timeoutSec int
+	var noCache bool
+	var cacheDir string
+	var sbomOut string
+	var sbomFormat string
+
+	bindCommonFlags(fs, &c)
+	bindRiskFlags(fs, &rf)
+	fs.StringVar(&offlineDB, "offline-db", "", "path to offline OSV advisory JSON file")
+	fs.BoolVar(&online, "online", false, "query live api.osv.dev batch endpoint against extracted OS packages")
+	fs.StringVar(&osvURL, "osv-url", deps.DefaultOSVBaseURL, "OSV API base URL")
+	fs.IntVar(&timeoutSec, "timeout", 15, "OSV/KEV/EPSS HTTP timeout in seconds")
+	fs.BoolVar(&noCache, "no-cache", false, "disable local advisory disk cache")
+	fs.StringVar(&cacheDir, "cache-dir", "", "override local advisory disk cache directory")
+	fs.StringVar(&sbomOut, "sbom-out", "", "optional file path to write extracted container OS SBOM")
+	fs.StringVar(&sbomFormat, "sbom-format", "cyclonedx", "SBOM output format when --sbom-out is set: cyclonedx or spdx")
+
+	if code, ok := parseFlagsWithHelp(fs, args, stdout, stderr); !ok {
+		return code
+	}
+	if err := validateCommonFlags(fs, &c); err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return exitErr
+	}
+
+	pol, err := policy.LoadOptionalPolicy(c.path, c.policy)
+	if err != nil {
+		fmt.Fprintf(stderr, "policy error: %v\n", err)
+		return exitErr
+	}
+
+	imgRes, err := image.ScanTarball(c.path)
+	if err != nil {
+		fmt.Fprintf(stderr, "scan-image error: %v\n", err)
+		return exitErr
+	}
+
+	if strings.TrimSpace(sbomOut) != "" {
+		sbomJSON, sErr := encodeSBOMByFormat(c.path, imgRes.Components, sbomFormat)
+		if sErr != nil {
+			fmt.Fprintf(stderr, "scan-image sbom error: %v\n", sErr)
+			return exitErr
+		}
+		if writeCode := writeTextOrFile(sbomOut, sbomJSON+"\n", stdout, stderr); writeCode != exitOK {
+			return writeCode
+		}
+	}
+
+	var denied []string
+	if pol != nil {
+		denied = pol.DeniedLicenses
+	}
+	findings := append([]schema.Finding{}, imgRes.Findings...)
+	findings = append(findings, deps.AuditLicenses(imgRes.Components, denied)...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec+15)*time.Second)
+	defer cancel()
+	vulnFindings, err := deps.AuditDependencies(ctx, imgRes.Components, deps.OSVOptions{
+		Online:        online,
+		BaseURL:       osvURL,
+		Timeout:       time.Duration(timeoutSec) * time.Second,
+		OfflineDBPath: offlineDB,
+		CacheDir:      cacheDir,
+		NoCache:       noCache,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "scan-image OSV error: %v\n", err)
+		return exitErr
+	}
+	vulnFindings, err = applyRiskEnrichment(ctx, vulnFindings, rf, cacheDir, noCache, timeoutSec)
+	if err != nil {
+		fmt.Fprintf(stderr, "scan-image risk enrichment error: %v\n", err)
+		return exitErr
+	}
 	findings = append(findings, vulnFindings...)
 	return finalizeScan(findings, pol, c, stdout, stderr)
 }
 
 func runSBOM(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("sbom", flag.ContinueOnError)
-	var targetPath, outPath string
+	var targetPath, outPath, formatStr string
 	fs.StringVar(&targetPath, "path", ".", "project root directory")
-	fs.StringVar(&outPath, "output", "", "write CycloneDX 1.5 JSON to file")
+	fs.StringVar(&outPath, "output", "", "write SBOM JSON to file")
+	fs.StringVar(&formatStr, "format", "cyclonedx", "SBOM format: cyclonedx or spdx")
 
 	if code, ok := parseFlagsWithHelp(fs, args, stdout, stderr); !ok {
 		return code
@@ -433,26 +592,126 @@ func runSBOM(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "sbom inventory error: %v\n", err)
 		return exitErr
 	}
-	sbomJSON, err := deps.GenerateCycloneDX(targetPath, comps)
+	sbomJSON, err := encodeSBOMByFormat(targetPath, comps, formatStr)
 	if err != nil {
 		fmt.Fprintf(stderr, "sbom generation error: %v\n", err)
 		return exitErr
 	}
-	if strings.TrimSpace(outPath) != "" {
-		if dir := filepath.Dir(outPath); dir != "." && dir != "" {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				fmt.Fprintf(stderr, "create sbom dir error: %v\n", err)
-				return exitErr
+	return writeTextOrFile(outPath, sbomJSON+"\n", stdout, stderr)
+}
+
+func runSBOMDiff(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("sbom-diff", flag.ContinueOnError)
+	var oldPath, newPath, formatStr, outPath string
+	fs.StringVar(&oldPath, "old", "", "baseline CycloneDX or SPDX JSON SBOM file")
+	fs.StringVar(&newPath, "new", "", "target CycloneDX or SPDX JSON SBOM file")
+	fs.StringVar(&formatStr, "format", "table", "output format: table, json, markdown")
+	fs.StringVar(&outPath, "output", "", "write SBOM diff output to file")
+
+	if code, ok := parseFlagsWithHelp(fs, args, stdout, stderr); !ok {
+		return code
+	}
+	if oldPath == "" && newPath == "" && fs.NArg() == 2 {
+		oldPath = fs.Arg(0)
+		newPath = fs.Arg(1)
+	} else if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "unexpected positional arguments: %s\n", strings.Join(fs.Args(), " "))
+		return exitErr
+	}
+	if strings.TrimSpace(oldPath) == "" || strings.TrimSpace(newPath) == "" {
+		fmt.Fprintf(stderr, "both --old and --new SBOM file paths are required\n")
+		return exitErr
+	}
+
+	diff, err := deps.DiffSBOMFiles(oldPath, newPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "sbom-diff error: %v\n", err)
+		return exitErr
+	}
+	rendered, err := deps.FormatSBOMDiff(diff, formatStr)
+	if err != nil {
+		fmt.Fprintf(stderr, "sbom-diff format error: %v\n", err)
+		return exitErr
+	}
+	return writeTextOrFile(outPath, rendered, stdout, stderr)
+}
+
+func runFixPreview(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("fix-preview", flag.ContinueOnError)
+	var filePath, kind, formatStr, outPath string
+	fs.StringVar(&filePath, "path", "", "path to Dockerfile, Kubernetes YAML, or GitHub Actions workflow")
+	fs.StringVar(&kind, "kind", "", "format kind: dockerfile, kubernetes, or github-actions (auto-detected if omitted)")
+	fs.StringVar(&formatStr, "format", "diff", "output format: diff or json")
+	fs.StringVar(&outPath, "output", "", "write fix preview output to file")
+
+	if code, ok := parseFlagsWithHelp(fs, args, stdout, stderr); !ok {
+		return code
+	}
+	if filePath == "" && fs.NArg() == 1 {
+		filePath = fs.Arg(0)
+	} else if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "unexpected positional arguments: %s\n", strings.Join(fs.Args(), " "))
+		return exitErr
+	}
+	if strings.TrimSpace(filePath) == "" {
+		fmt.Fprintf(stderr, "--path is required for fix-preview\n")
+		return exitErr
+	}
+	rawBytes, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "read %q error: %v\n", filePath, err)
+		return exitErr
+	}
+	if strings.TrimSpace(kind) == "" {
+		kind = inferFixKind(filePath)
+	}
+	res, err := fix.SuggestFixes(string(rawBytes), kind, filepath.ToSlash(filePath))
+	if err != nil {
+		fmt.Fprintf(stderr, "fix-preview error: %v\n", err)
+		return exitErr
+	}
+
+	switch strings.ToLower(strings.TrimSpace(formatStr)) {
+	case "", "diff":
+		var b strings.Builder
+		if !res.Changed && len(res.ManualReviews) == 0 {
+			b.WriteString("No automated fixes required.\n")
+		} else {
+			for _, ch := range res.Changes {
+				fmt.Fprintf(&b, "* %s\n", ch)
+			}
+			for _, mr := range res.ManualReviews {
+				fmt.Fprintf(&b, "! manual: %s\n", mr)
+			}
+			if res.Diff != "" {
+				b.WriteByte('\n')
+				b.WriteString(res.Diff)
 			}
 		}
-		if err := os.WriteFile(outPath, []byte(sbomJSON+"\n"), 0o644); err != nil {
-			fmt.Fprintf(stderr, "write sbom file error: %v\n", err)
+		return writeTextOrFile(outPath, b.String(), stdout, stderr)
+	case "json":
+		raw, mErr := json.MarshalIndent(res, "", "  ")
+		if mErr != nil {
+			fmt.Fprintf(stderr, "marshal fix-preview JSON error: %v\n", mErr)
 			return exitErr
 		}
-		return exitOK
+		return writeTextOrFile(outPath, string(raw)+"\n", stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "invalid --format %q: expected diff or json\n", formatStr)
+		return exitErr
 	}
-	fmt.Fprintln(stdout, sbomJSON)
-	return exitOK
+}
+
+func inferFixKind(filePath string) string {
+	low := strings.ToLower(filepath.ToSlash(filePath))
+	base := filepath.Base(low)
+	if base == "dockerfile" || strings.HasPrefix(base, "dockerfile.") || strings.HasSuffix(base, ".dockerfile") {
+		return "dockerfile"
+	}
+	if strings.Contains(low, ".github/workflows/") {
+		return "github-actions"
+	}
+	return "kubernetes"
 }
 
 func runScanIaC(args []string, stdout, stderr io.Writer) int {
@@ -500,6 +759,7 @@ func runScanCI(args []string, stdout, stderr io.Writer) int {
 func runScanRepo(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("scan-repo", flag.ContinueOnError)
 	var c commonScanFlags
+	var rf riskFlags
 	var offlineDB string
 	var online bool
 	var osvURL string
@@ -509,13 +769,14 @@ func runScanRepo(args []string, stdout, stderr io.Writer) int {
 	var cacheDir string
 
 	bindCommonFlags(fs, &c)
+	bindRiskFlags(fs, &rf)
 	fs.StringVar(&offlineDB, "offline-db", "", "path to offline OSV advisory JSON file")
 	fs.BoolVar(&online, "online", false, "query live api.osv.dev batch endpoint")
 	fs.StringVar(&osvURL, "osv-url", deps.DefaultOSVBaseURL, "OSV API base URL")
 	fs.Float64Var(&entropy, "entropy", secrets.DefaultMinEntropy, "Shannon entropy threshold")
 	fs.IntVar(&gitHistory, "git-history", 0, "scan last N git commits for leaked history secrets")
-	fs.BoolVar(&noCache, "no-cache", false, "disable local OSV disk response cache")
-	fs.StringVar(&cacheDir, "cache-dir", "", "override OSV advisory disk cache directory")
+	fs.BoolVar(&noCache, "no-cache", false, "disable local OSV/KEV/EPSS disk response cache")
+	fs.StringVar(&cacheDir, "cache-dir", "", "override local advisory disk cache directory")
 
 	if code, ok := parseFlagsWithHelp(fs, args, stdout, stderr); !ok {
 		return code
@@ -571,7 +832,7 @@ func runScanRepo(args []string, stdout, stderr io.Writer) int {
 	}
 	allFindings = append(allFindings, deps.AuditLicenses(comps, denied)...)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	vulnFindings, err := deps.AuditDependencies(ctx, comps, deps.OSVOptions{
 		Online:        online,
@@ -583,6 +844,11 @@ func runScanRepo(args []string, stdout, stderr io.Writer) int {
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "scan-repo OSV error: %v\n", err)
+		return exitErr
+	}
+	vulnFindings, err = applyRiskEnrichment(ctx, vulnFindings, rf, cacheDir, noCache, 15)
+	if err != nil {
+		fmt.Fprintf(stderr, "scan-repo risk enrichment error: %v\n", err)
 		return exitErr
 	}
 	allFindings = append(allFindings, vulnFindings...)

@@ -16,7 +16,7 @@ func TestCLISubcommandsHardenedAndVulnerableFixtures(t *testing.T) {
 	// 1. version --json
 	var out, errBuf bytes.Buffer
 	code := run([]string{"version", "--json"}, &out, &errBuf, strings.NewReader(""))
-	if code != exitOK || !strings.Contains(out.String(), `"raksa-pipeguard"`) || !strings.Contains(out.String(), `"0.2.0"`) {
+	if code != exitOK || !strings.Contains(out.String(), `"raksa-pipeguard"`) || !strings.Contains(out.String(), `"0.3.0"`) {
 		t.Fatalf("version --json failed code=%d out=%s err=%s", code, out.String(), errBuf.String())
 	}
 
@@ -24,7 +24,7 @@ func TestCLISubcommandsHardenedAndVulnerableFixtures(t *testing.T) {
 	out.Reset()
 	errBuf.Reset()
 	code = run([]string{"rules"}, &out, &errBuf, strings.NewReader(""))
-	if code != exitOK || !strings.Contains(out.String(), "Total rules: 29") {
+	if code != exitOK || !strings.Contains(out.String(), "Total rules: 33") {
 		t.Fatalf("rules failed code=%d out=%s err=%s", code, out.String(), errBuf.String())
 	}
 
@@ -174,10 +174,161 @@ func TestCLISubcommandsHardenedAndVulnerableFixtures(t *testing.T) {
 		t.Fatalf("expected managed hook file to be removed")
 	}
 
-	// 7. Unknown subcommand returns exit 1
+	// 7. v0.3.0 SPDX SBOM + sbom-diff + fix-preview + markdown output + KEV escalation
+	tmpOutDir := t.TempDir()
+	spdxOut := filepath.Join(tmpOutDir, "sbom.spdx.json")
+	cdxOut := filepath.Join(tmpOutDir, "sbom.cdx.json")
+	out.Reset()
+	errBuf.Reset()
+	if got := run([]string{"sbom", "--path", vuln, "--format", "spdx", "--output", spdxOut}, &out, &errBuf, strings.NewReader("")); got != exitOK {
+		t.Fatalf("sbom --format spdx failed: code=%d err=%s", got, errBuf.String())
+	}
+	spdxRaw, _ := os.ReadFile(spdxOut)
+	if !strings.Contains(string(spdxRaw), `"spdxVersion": "SPDX-2.3"`) {
+		t.Fatalf("expected SPDX-2.3 JSON, got: %s", string(spdxRaw))
+	}
+	_ = run([]string{"sbom", "--path", hardened, "--format", "cyclonedx", "--output", cdxOut}, &out, &errBuf, strings.NewReader(""))
+	out.Reset()
+	errBuf.Reset()
+	if got := run([]string{"sbom-diff", "--old", cdxOut, "--new", spdxOut, "--format", "markdown"}, &out, &errBuf, strings.NewReader("")); got != exitOK || !strings.Contains(out.String(), "### SBOM Diff Summary") {
+		t.Fatalf("sbom-diff markdown failed: code=%d out=%s err=%s", got, out.String(), errBuf.String())
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	if got := run([]string{"fix-preview", "--path", filepath.Join(vuln, "deployment.yaml"), "--format", "json"}, &out, &errBuf, strings.NewReader("")); got != exitOK || !strings.Contains(out.String(), `"changed": true`) {
+		t.Fatalf("fix-preview failed: code=%d out=%s err=%s", got, out.String(), errBuf.String())
+	}
+
+	kevFile := filepath.Join(tmpOutDir, "kev.json")
+	_ = os.WriteFile(kevFile, []byte(`{"vulnerabilities":[{"cveID":"CVE-2021-23337","vulnerabilityName":"Lodash KEV"}]}`), 0o600)
+	out.Reset()
+	errBuf.Reset()
+	code = run([]string{"scan-deps", "--path", vuln, "--offline-db", filepath.Join(vuln, "offline_osv.json"), "--kev-db", kevFile, "--format", "markdown"}, &out, &errBuf, strings.NewReader(""))
+	if code != exitBreach || !strings.Contains(out.String(), "PIPE-106") || !strings.Contains(out.String(), "**[CISA KEV]**") {
+		t.Fatalf("expected PIPE-106 KEV markdown output, got code=%d out=%s err=%s", code, out.String(), errBuf.String())
+	}
+
+	// 8. Unknown subcommand returns exit 1
 	out.Reset()
 	errBuf.Reset()
 	if got := run([]string{"unknown-cmd"}, &out, &errBuf, strings.NewReader("")); got != exitErr {
 		t.Fatalf("expected exit 1 on unknown command, got %d", got)
+	}
+}
+
+func TestAdversarialBypassRegressions(t *testing.T) {
+	adv := t.TempDir()
+	wfDir := filepath.Join(adv, ".github", "workflows")
+	if err := os.MkdirAll(wfDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Secret without classic prefix (MY_CRED=...)
+	credSecret := "z9K4mQ" + "8wX2pL" + "7vR5nT" + "3yB6jF" + "1dH8sW" + "4cN0eA" + "2qZ7"
+	_ = os.WriteFile(filepath.Join(adv, "secret_unlabeled.env"), []byte("MY_CRED="+credSecret+"\n"), 0o600)
+
+	// 2. K8s CronJob with privileged initContainers
+	k8sCron := `apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly
+spec:
+  schedule: "0 0 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          initContainers:
+            - name: init-root
+              image: alpine:3.21
+              securityContext:
+                privileged: true
+          containers:
+            - name: job
+              image: alpine:3.21
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                limits:
+                  cpu: "100m"
+                  memory: "128Mi"
+`
+	_ = os.WriteFile(filepath.Join(adv, "cronjob.yaml"), []byte(k8sCron), 0o600)
+
+	// 3. Terraform GCP firewall + variable indirection + Azure NSG
+	tfAdv := `variable "cidr" {
+  default = "0.0.0.0/0"
+}
+resource "google_compute_firewall" "open_ssh" {
+  name          = "allow-ssh"
+  source_ranges = ["0.0.0.0/0"]
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+}
+resource "aws_security_group" "var_open" {
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.cidr]
+  }
+}
+resource "azurerm_network_security_rule" "az_rdp" {
+  name                   = "open-rdp"
+  direction              = "Inbound"
+  access                 = "Allow"
+  source_address_prefix  = "*"
+  destination_port_range = "3389"
+}
+`
+	_ = os.WriteFile(filepath.Join(adv, "multi.tf"), []byte(tfAdv), 0o600)
+
+	// 4. Dockerfile ARG-interpolated :latest tag
+	_ = os.WriteFile(filepath.Join(adv, "Dockerfile"), []byte("ARG TAG=latest\nFROM alpine:$TAG\nUSER 10001\n"), 0o600)
+
+	// 5. GitHub Actions github-script with.script injection
+	ghScript := `name: Script Injection
+on: [pull_request_target]
+permissions:
+  contents: read
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "${{ github.event.pull_request.title }}";
+            console.log(title);
+`
+	_ = os.WriteFile(filepath.Join(wfDir, "script.yml"), []byte(ghScript), 0o600)
+
+	// 6. package.json without package-lock.json still triggers OSV CVE match
+	_ = os.WriteFile(filepath.Join(adv, "package.json"), []byte(`{"name":"x","dependencies":{"lodash":"4.17.20"}}`), 0o600)
+
+	var out, errBuf bytes.Buffer
+	code := run([]string{
+		"scan-repo",
+		"--path", adv,
+		"--offline-db", filepath.Join("..", "..", "testdata", "vulnerable", "offline_osv.json"),
+		"--fail-on", "critical",
+		"--format", "json",
+	}, &out, &errBuf, strings.NewReader(""))
+	if code != exitBreach {
+		t.Fatalf("expected adversarial scan-repo exit 2, got code=%d err=%s out=%s", code, errBuf.String(), out.String())
+	}
+
+	raw := out.String()
+	for _, wantRule := range []string{"PIPE-005", "PIPE-101", "PIPE-104", "PIPE-202", "PIPE-301", "PIPE-304", "PIPE-305", "PIPE-306", "PIPE-402"} {
+		if !strings.Contains(raw, wantRule) {
+			t.Fatalf("adversarial regression missed rule %s in output:\n%s", wantRule, raw)
+		}
 	}
 }

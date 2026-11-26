@@ -95,14 +95,13 @@ func ScanTarball(tarPath string) (ImageScanResult, error) {
 		}
 		clean := normalizeArchivePath(hdr.Name)
 		if hdr.Size > MaxTarEntryBytes {
-			// Skip oversized binary layer entries on metadata buffer if above per-entry cap,
-			// unless it's a layer we stream lazily in Pass 2.
+			// Skip oversized entries from Pass 1 metadata buffer; layers stream cleanly in Pass 2.
 			continue
 		}
 		if totalRead+hdr.Size > MaxTarUnpackedBytes {
 			return ImageScanResult{}, fmt.Errorf("image archive %q exceeds %d byte safety budget", tarPath, MaxTarUnpackedBytes)
 		}
-		if isImageMetadataFile(clean) {
+		if isImageMetadataFile(clean, hdr.Size) {
 			data, readErr := readBoundedEntry(tr, hdr.Size)
 			if readErr != nil {
 				return ImageScanResult{}, readErr
@@ -209,16 +208,11 @@ func openStreamMaybeGzip(r io.Reader) (io.Reader, io.Closer, error) {
 	return br, nil, nil
 }
 
-func isImageMetadataFile(clean string) bool {
-	if clean == "manifest.json" || clean == "index.json" || clean == "oci-layout" {
-		return true
+func isImageMetadataFile(clean string, size int64) bool {
+	if clean == "manifest.json" || clean == "index.json" || clean == "oci-layout" || strings.HasSuffix(clean, ".json") {
+		return size <= 2*1024*1024
 	}
-	return strings.HasSuffix(clean, ".json") || strings.HasPrefix(clean, "blobs/sha256/") && !isLikelyTarHeaderPath(clean)
-}
-
-func isLikelyTarHeaderPath(_ string) bool {
-	// Guard inside loop skips files > MaxTarEntryBytes anyway; allow reading JSON manifests/configs safely.
-	return false
+	return strings.HasPrefix(clean, "blobs/sha256/") && size <= 512*1024
 }
 
 func resolveImageStructure(entries map[string][]byte, fallbackName string) (cfgPath string, layers []string, imageRef, formatName string, err error) {

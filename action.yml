@@ -8,11 +8,11 @@ inputs:
     required: false
     default: "."
   mode:
-    description: "Scan subcommand: repo, secrets, deps, iac, ci, sbom"
+    description: "Scan subcommand: repo, secrets, deps, image, iac, ci, sbom"
     required: false
     default: "repo"
   format:
-    description: "Output format: table, json, sarif"
+    description: "Output format: table, json, sarif, markdown"
     required: false
     default: "sarif"
   fail-on:
@@ -44,7 +44,19 @@ inputs:
     required: false
     default: ""
   no-cache:
-    description: "Bypass local OSV disk response cache (true or false)"
+    description: "Bypass local OSV/KEV/EPSS disk response cache (true or false)"
+    required: false
+    default: "false"
+  kev-db:
+    description: "Optional offline CISA KEV catalog JSON file"
+    required: false
+    default: ""
+  online-kev:
+    description: "Enable live cached CISA KEV lookup (true or false)"
+    required: false
+    default: "false"
+  online-epss:
+    description: "Enable live cached FIRST EPSS lookup (true or false)"
     required: false
     default: "false"
   output:
@@ -95,6 +107,9 @@ runs:
         PG_BASELINE: ${{ inputs.baseline }}
         PG_DIFF_BASE: ${{ inputs.diff-base }}
         PG_NO_CACHE: ${{ inputs.no-cache }}
+        PG_KEV_DB: ${{ inputs.kev-db }}
+        PG_ONLINE_KEV: ${{ inputs.online-kev }}
+        PG_ONLINE_EPSS: ${{ inputs.online-epss }}
         PG_OUTPUT: ${{ inputs.output }}
       run: |
         args=()
@@ -102,6 +117,7 @@ runs:
           repo)    subcmd="scan-repo" ;;
           secrets) subcmd="scan-secrets" ;;
           deps)    subcmd="scan-deps" ;;
+          image)   subcmd="scan-image" ;;
           iac)     subcmd="scan-iac" ;;
           ci)      subcmd="scan-ci" ;;
           sbom)    subcmd="sbom" ;;
@@ -130,7 +146,7 @@ runs:
           if [ -n "$out_file" ]; then
             args+=("--output" "$out_file")
           fi
-          if [ "$subcmd" = "scan-repo" ] || [ "$subcmd" = "scan-deps" ]; then
+          if [ "$subcmd" = "scan-repo" ] || [ "$subcmd" = "scan-deps" ] || [ "$subcmd" = "scan-image" ]; then
             if [ -n "$PG_OFFLINE_DB" ]; then
               args+=("--offline-db" "$PG_OFFLINE_DB")
             fi
@@ -139,6 +155,15 @@ runs:
             fi
             if [ "$PG_NO_CACHE" = "true" ]; then
               args+=("--no-cache")
+            fi
+            if [ -n "$PG_KEV_DB" ]; then
+              args+=("--kev-db" "$PG_KEV_DB")
+            fi
+            if [ "$PG_ONLINE_KEV" = "true" ]; then
+              args+=("--online-kev")
+            fi
+            if [ "$PG_ONLINE_EPSS" = "true" ]; then
+              args+=("--online-epss")
             fi
           fi
           if [ "$subcmd" = "scan-repo" ] || [ "$subcmd" = "scan-secrets" ]; then
