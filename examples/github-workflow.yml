@@ -16,15 +16,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # For production SLSA L3 / PIPE-404 compliance, pin to the full 40-character commit SHA of the v0.2.0 release.
+      # For production SLSA L3 / PIPE-404 compliance, pin to the full 40-character commit SHA of the v0.3.0 release.
       - name: Run Raksa PipeGuard Gate
-        uses: luminariadev/raksa-pipeguard@v0.2.0
+        uses: luminariadev/raksa-pipeguard@v0.3.0
         with:
           path: .
           mode: repo
           format: sarif
           fail-on: high
-          # Optional for PR-scoped gating against base branch:
+          # Optional KEV/EPSS enrichment, PR diff scoping, or Markdown summary:
+          # online-kev: "true"
+          # online-epss: "true"
           # diff-base: origin/main
           output: pipeguard.sarif
 

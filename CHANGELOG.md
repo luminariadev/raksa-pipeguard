@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.0] - 2026-11-27
+
+### Added
+
+- **4 New Enterprise Rules (33 total, `PIPE-001`..`PIPE-501`)**:
+  - `PIPE-106`: Upgrades dependency and container OS vulnerabilities matched in the CISA Known Exploited Vulnerabilities (KEV) catalog or meeting configurable FIRST EPSS exploit probability thresholds (`>= 0.50` by default) to `critical` priority.
+  - `PIPE-305`: Terraform GCP CIS checks for public firewall ingress (`0.0.0.0/0` / `::/0` on SSH/RDP/management ports), public storage IAM bindings (`allUsers` / `allAuthenticatedUsers`), uniform bucket-level access, and public Cloud SQL instances.
+  - `PIPE-306`: Terraform Azure CIS checks for open NSG inbound rules (`*` / `0.0.0.0/0` / `Internet` on management ports), public blob access, and disabled HTTPS-only storage enforcement.
+  - `PIPE-408`: GitHub Actions untrusted writes to `$GITHUB_ENV` / `$GITHUB_PATH` and privileged `workflow_run` execution after untrusted artifact downloads.
+- **Pure-Go Container Image Tarball Scanner (`scan-image` / `pipeguard_scan_image`)**: Inspects Docker save (`manifest.json`) and OCI layout (`index.json`) container tarballs without requiring a Docker daemon, auditing root runtime users (`PIPE-201`), baked `Env` credentials (`PIPE-203`), ordered overlay whiteouts, Alpine `apk` and Debian/Distroless `dpkg` (`status` / `status.d/*`) package inventories, SPDX license compliance, and OSV/KEV/EPSS advisories.
+- **SPDX 2.3 JSON SBOM & `sbom-diff`**: Added `--format spdx` alongside CycloneDX 1.5 in `sbom` / `pipeguard_generate_sbom`, plus the `sbom-diff` subcommand comparing added, removed, version-changed, and license-changed components across both CycloneDX 1.5 and SPDX 2.3 files.
+- **Markdown PR Reporter & Deterministic Remediation Engine (`fix-preview` / `pipeguard_suggest_fix`)**: Added `--format markdown` (`md`) for PR-ready Markdown tables and deterministic hardening patches with unified diffs across Dockerfiles, Kubernetes YAML, and GitHub Actions workflows.
+- **9-Tool MCP Server & Updated `action.yml`**: Registered `pipeguard_scan_image` and `pipeguard_suggest_fix`, and added `mode: image`, `format: markdown`, `kev-db`, `online-kev`, and `online-epss` inputs.
+
+### Fixed & Improved
+
+- **Adversarial Bypass Closures (6/6 Hardened)**:
+  - Context-aware high-entropy detection for unlabeled secret keys (`MY_CRED=...`) inside `.env`/config targets (`PIPE-005`).
+  - Kubernetes `CronJob` (`spec.jobTemplate`) and `initContainers` / `ephemeralContainers` inspection (`PIPE-301`..`PIPE-303`).
+  - Two-pass Terraform HCL `var.*` and `local.*` resolution across AWS, GCP, and Azure resources (`PIPE-304`..`PIPE-306`).
+  - Dockerfile `ARG` interpolation in `FROM` base image resolution (`PIPE-202`) and `curl -k` / `wget --no-check-certificate` detection (`PIPE-204`).
+  - GitHub Actions `actions/github-script` `with.script` untrusted `${{ github.event.* }}` expression injection (`PIPE-402`).
+  - Manifest-only `package.json` dependency extraction fallback when `package-lock.json` is absent.
+
 ## [0.2.0] - 2026-11-26
 
 ### Added
