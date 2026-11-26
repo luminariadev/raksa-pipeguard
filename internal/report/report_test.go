@@ -97,4 +97,15 @@ func TestJSONAndSARIF21Output(t *testing.T) {
 	if len(rules) != 2 || rules[0].(map[string]any)["id"] != "PIPE-201" || rules[1].(map[string]any)["id"] != "PIPE-401" {
 		t.Fatalf("rules not sorted deterministically: %+v", rules)
 	}
+
+	// Markdown PR summary rendering including risk badges and pipe escaping.
+	rep.Findings[0].Evidence["kev"] = true
+	rep.Findings[0].Evidence["epss_score"] = 0.88
+	mdOut := FormatMarkdownRender(rep)
+	if !strings.Contains(mdOut, "## Raksa PipeGuard Security Report") || !strings.Contains(mdOut, "**[CISA KEV]**") || !strings.Contains(mdOut, "`EPSS 0.88`") {
+		t.Fatalf("unexpected Markdown output:\n%s", mdOut)
+	}
+	if parsedFmt, err := ParseFormat("md"); err != nil || parsedFmt != FormatMarkdown {
+		t.Fatalf("expected 'md' to parse as FormatMarkdown, got %v err=%v", parsedFmt, err)
+	}
 }

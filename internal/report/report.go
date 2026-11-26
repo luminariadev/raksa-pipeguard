@@ -19,9 +19,10 @@ const (
 type OutputFormat string
 
 const (
-	FormatTable OutputFormat = "table"
-	FormatJSON  OutputFormat = "json"
-	FormatSARIF OutputFormat = "sarif"
+	FormatTable    OutputFormat = "table"
+	FormatJSON     OutputFormat = "json"
+	FormatSARIF    OutputFormat = "sarif"
+	FormatMarkdown OutputFormat = "markdown"
 )
 
 func ParseFormat(raw string) (OutputFormat, error) {
@@ -32,8 +33,10 @@ func ParseFormat(raw string) (OutputFormat, error) {
 		return FormatJSON, nil
 	case "sarif":
 		return FormatSARIF, nil
+	case "markdown", "md":
+		return FormatMarkdown, nil
 	default:
-		return "", fmt.Errorf("invalid output format %q: expected table, json, or sarif", raw)
+		return "", fmt.Errorf("invalid output format %q: expected table, json, sarif, or markdown", raw)
 	}
 }
 
@@ -47,6 +50,8 @@ func WriteReport(w io.Writer, rep schema.Report, format OutputFormat) error {
 		rendered, err = FormatJSONRender(rep)
 	case FormatSARIF:
 		rendered, err = FormatSARIFRender(rep)
+	case FormatMarkdown:
+		rendered = FormatMarkdownRender(rep)
 	default:
 		return fmt.Errorf("unsupported format %q", format)
 	}
@@ -152,6 +157,62 @@ func FormatJSONRender(rep schema.Report) (string, error) {
 		return "", err
 	}
 	return string(raw) + "\n", nil
+}
+
+// FormatMarkdownRender formats rep as a PR-ready GitHub/GitLab Markdown summary table.
+func FormatMarkdownRender(rep schema.Report) string {
+	var b strings.Builder
+	b.WriteString("## Raksa PipeGuard Security Report\n\n")
+	scoreStr := "N/A"
+	if rep.Posture != nil {
+		scoreStr = fmt.Sprintf("**%d/100 (%s)**", rep.Posture.Score, SanitizeTerminalText(rep.Posture.Grade))
+	}
+	fmt.Fprintf(&b, "- **Tool**: `%s` `v%s` (`%s`)\n", SanitizeTerminalText(rep.Tool), schema.Version, SanitizeTerminalText(rep.Layer))
+	fmt.Fprintf(&b, "- **Posture Score**: %s\n", scoreStr)
+	fmt.Fprintf(&b, "- **Findings**: `%d` total (`%d` critical, `%d` high, `%d` medium, `%d` low, `%d` info)\n\n",
+		rep.Summary.Total, rep.Summary.Critical, rep.Summary.High, rep.Summary.Medium, rep.Summary.Low, rep.Summary.Info)
+
+	if len(rep.Findings) == 0 {
+		b.WriteString("_No security findings detected._\n")
+		return b.String()
+	}
+
+	b.WriteString("| Severity | Rule | Module | Target | Title & Risk Context |\n")
+	b.WriteString("| --- | --- | --- | --- | --- |\n")
+	for _, f := range rep.Findings {
+		sev := strings.ToUpper(SanitizeTerminalText(string(f.Severity)))
+		rule := SanitizeTerminalText(f.RuleID)
+		mod := SanitizeTerminalText(f.Module)
+		target := escapeMDCell(SanitizeTerminalText(f.Target))
+		title := escapeMDCell(SanitizeTerminalText(f.Title))
+		tags := formatFindingRiskTags(f.Evidence)
+		fmt.Fprintf(&b, "| `%s` | `%s` | `%s` | `%s` | %s%s |\n", sev, rule, mod, target, title, tags)
+	}
+	return b.String()
+}
+
+func formatFindingRiskTags(ev map[string]any) string {
+	if len(ev) == 0 {
+		return ""
+	}
+	var badges []string
+	if kev, ok := ev["kev"].(bool); ok && kev {
+		badges = append(badges, "**[CISA KEV]**")
+	}
+	if epss, ok := ev["epss_score"].(float64); ok && epss > 0 {
+		badges = append(badges, fmt.Sprintf("`EPSS %.2f`", epss))
+	}
+	if fixed, ok := ev["fixed_version"].(string); ok && strings.TrimSpace(fixed) != "" {
+		badges = append(badges, fmt.Sprintf("fix: `%s`", escapeMDCell(SanitizeTerminalText(fixed))))
+	}
+	if len(badges) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(badges, ", ") + ")"
+}
+
+func escapeMDCell(s string) string {
+	return strings.ReplaceAll(s, "|", `\|`)
 }
 
 func FormatSARIFRender(rep schema.Report) (string, error) {
