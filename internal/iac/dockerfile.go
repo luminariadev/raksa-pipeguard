@@ -28,8 +28,11 @@ type dockerStage struct {
 
 var (
 	curlPipeShellRe = regexp.MustCompile(`(?i)\b(?:curl|wget)\b[^|\r\n]*\|\s*(?:sh|bash|ash|dash|zsh)\b`)
+	insecureTLSRe   = regexp.MustCompile(`(?i)(?:\bcurl\b[^|\r\n]*(?:\s-k(?:\s|$)|--insecure\b)|\bwget\b[^|\r\n]*--no-check-certificate\b)`)
 	addRemoteHTTPRe = regexp.MustCompile(`(?i)^https?://`)
 	sudoOrChmodRe   = regexp.MustCompile(`(?i)(?:^|[;&|]\s*)\bsudo\b|chmod\s+(?:-R\s+)?(?:0?777|[ugo]*\+s)`)
+	dockerVarBraced = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}`)
+	dockerVarBare   = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*)`)
 )
 
 func LintDockerfile(content string, target string) []schema.Finding {
@@ -40,9 +43,11 @@ func LintDockerfile(content string, target string) []schema.Finding {
 
 	now := time.Now().UTC()
 	var (
-		findings []schema.Finding
-		stages   []dockerStage
-		aliases  = make(map[string]bool)
+		findings   []schema.Finding
+		stages     []dockerStage
+		aliases    = make(map[string]bool)
+		globalArgs = make(map[string]string)
+		stageArgs  = make(map[string]string)
 	)
 
 	var curStage *dockerStage
@@ -50,7 +55,8 @@ func LintDockerfile(content string, target string) []schema.Finding {
 	for _, inst := range insts {
 		switch inst.cmd {
 		case "FROM":
-			img, alias := parseFromArgs(inst.args)
+			rawImg, alias := parseFromArgs(inst.args)
+			img := resolveDockerVars(rawImg, globalArgs)
 			st := dockerStage{
 				lineNo: inst.lineNo,
 				image:  img,
@@ -58,6 +64,10 @@ func LintDockerfile(content string, target string) []schema.Finding {
 			}
 			stages = append(stages, st)
 			curStage = &stages[len(stages)-1]
+			stageArgs = make(map[string]string)
+			for k, v := range globalArgs {
+				stageArgs[k] = v
+			}
 
 			imgLow := strings.ToLower(img)
 			if imgLow != "scratch" && !aliases[imgLow] {
@@ -79,10 +89,13 @@ func LintDockerfile(content string, target string) []schema.Finding {
 
 		case "USER":
 			if curStage != nil {
-				userVal := strings.TrimSpace(strings.Fields(inst.args)[0])
-				curStage.hasUser = true
-				curStage.userLine = inst.lineNo
-				curStage.userVal = strings.ToLower(userVal)
+				fields := strings.Fields(inst.args)
+				if len(fields) > 0 {
+					userVal := strings.TrimSpace(fields[0])
+					curStage.hasUser = true
+					curStage.userLine = inst.lineNo
+					curStage.userVal = strings.ToLower(userVal)
+				}
 			}
 
 		case "EXPOSE":
@@ -110,6 +123,11 @@ func LintDockerfile(content string, target string) []schema.Finding {
 			}
 
 		case "ENV", "ARG":
+			if curStage == nil && inst.cmd == "ARG" {
+				recordDockerKeyVals(inst.args, globalArgs)
+			} else {
+				recordDockerKeyVals(inst.args, stageArgs)
+			}
 			if k, ok := findHardcodedSecretEnvArg(inst.args); ok {
 				findings = append(findings, schema.NewFinding(
 					"PIPE-203", "iac", schema.SeverityHigh,
@@ -132,6 +150,17 @@ func LintDockerfile(content string, target string) []schema.Finding {
 					map[string]any{"line": inst.lineNo, "standard": "OWASP CI/CD-SEC-4"},
 					"Download verified artifacts with SHA-256 checksum checks before executing them.",
 					"D3-CH", fmt.Sprintf("docker-l%d-pipe-sh", inst.lineNo), now,
+				))
+			}
+			if insecureTLSRe.MatchString(inst.args) {
+				findings = append(findings, schema.NewFinding(
+					"PIPE-204", "iac", schema.SeverityHigh,
+					"Dockerfile disables TLS certificate verification during download",
+					fmt.Sprintf("RUN instruction on line %d passes insecure TLS bypass flags (-k/--insecure/--no-check-certificate).", inst.lineNo),
+					target,
+					map[string]any{"line": inst.lineNo, "standard": "OWASP CI/CD-SEC-4"},
+					"Remove TLS verification bypass flags and verify artifact checksums.",
+					"D3-CH", fmt.Sprintf("docker-l%d-tls-bypass", inst.lineNo), now,
 				))
 			}
 			if sudoOrChmodRe.MatchString(inst.args) {
@@ -303,4 +332,49 @@ func findHardcodedSecretEnvArg(args string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func recordDockerKeyVals(args string, dest map[string]string) {
+	fields := strings.Fields(args)
+	if len(fields) >= 2 && !strings.Contains(fields[0], "=") {
+		val := strings.Trim(strings.Join(fields[1:], " "), `"'`)
+		dest[strings.TrimSpace(fields[0])] = val
+		return
+	}
+	for _, tok := range fields {
+		eq := strings.IndexByte(tok, '=')
+		if eq <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(tok[:eq])
+		v := strings.Trim(strings.TrimSpace(tok[eq+1:]), `"'`)
+		dest[k] = v
+	}
+}
+
+func resolveDockerVars(raw string, vars map[string]string) string {
+	out := dockerVarBraced.ReplaceAllStringFunc(raw, func(match string) string {
+		sub := dockerVarBraced.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		if v := strings.TrimSpace(vars[sub[1]]); v != "" {
+			return v
+		}
+		if len(sub) >= 3 && sub[2] != "" {
+			return sub[2]
+		}
+		return ""
+	})
+	out = dockerVarBare.ReplaceAllStringFunc(out, func(match string) string {
+		sub := dockerVarBare.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		if v, ok := vars[sub[1]]; ok {
+			return strings.TrimSpace(v)
+		}
+		return ""
+	})
+	return out
 }
