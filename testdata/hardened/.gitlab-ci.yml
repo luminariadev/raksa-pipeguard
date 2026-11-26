@@ -1,0 +1,16 @@
+stages:
+  - verify
+
+image: golang:1.26-alpine
+
+variables:
+  DOCKER_TLS_CERTDIR: "/certs"
+  DEPLOY_TOKEN: "$CI_DEPLOY_TOKEN"
+
+include:
+  - local: "/ci/shared.yml"
+
+verify_app:
+  stage: verify
+  script:
+    - go test -count=1 ./...

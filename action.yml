@@ -35,6 +35,18 @@ inputs:
     description: "Number of recent git commits to inspect for leaked secrets (0 disables history scan)"
     required: false
     default: "0"
+  baseline:
+    description: "Optional baseline JSON file path to suppress known fingerprints"
+    required: false
+    default: ""
+  diff-base:
+    description: "Optional git base ref (e.g. origin/main) for PR diff-scoped scanning"
+    required: false
+    default: ""
+  no-cache:
+    description: "Bypass local OSV disk response cache (true or false)"
+    required: false
+    default: "false"
   output:
     description: "Output report file path (optional)"
     required: false
@@ -80,6 +92,9 @@ runs:
         PG_OFFLINE_DB: ${{ inputs.offline-db }}
         PG_ONLINE_OSV: ${{ inputs.online-osv }}
         PG_GIT_HISTORY: ${{ inputs.git-history }}
+        PG_BASELINE: ${{ inputs.baseline }}
+        PG_DIFF_BASE: ${{ inputs.diff-base }}
+        PG_NO_CACHE: ${{ inputs.no-cache }}
         PG_OUTPUT: ${{ inputs.output }}
       run: |
         args=()
@@ -106,6 +121,12 @@ runs:
           if [ -n "$PG_POLICY" ]; then
             args+=("--policy" "$PG_POLICY")
           fi
+          if [ -n "$PG_BASELINE" ]; then
+            args+=("--baseline" "$PG_BASELINE")
+          fi
+          if [ -n "$PG_DIFF_BASE" ]; then
+            args+=("--diff-base" "$PG_DIFF_BASE")
+          fi
           if [ -n "$out_file" ]; then
             args+=("--output" "$out_file")
           fi
@@ -115,6 +136,9 @@ runs:
             fi
             if [ "$PG_ONLINE_OSV" = "true" ]; then
               args+=("--online")
+            fi
+            if [ "$PG_NO_CACHE" = "true" ]; then
+              args+=("--no-cache")
             fi
           fi
           if [ "$subcmd" = "scan-repo" ] || [ "$subcmd" = "scan-secrets" ]; then

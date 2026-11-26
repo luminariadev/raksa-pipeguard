@@ -154,3 +154,34 @@ func FilterBaseline(findings []schema.Finding, baseline map[string]struct{}) ([]
 	}
 	return kept, suppressed
 }
+
+// FilterFindingsByChangedFiles restricts workspace findings to files touched in changedSet (preserving PIPE-006 diff findings).
+func FilterFindingsByChangedFiles(root string, findings []schema.Finding, changedSet map[string]struct{}) []schema.Finding {
+	if changedSet == nil {
+		return findings
+	}
+	cleanRoot := filepath.ToSlash(filepath.Clean(root))
+	out := make([]schema.Finding, 0, len(findings))
+	for _, f := range findings {
+		if f.RuleID == "PIPE-006" {
+			out = append(out, f)
+			continue
+		}
+		rawTarget := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(f.Target)), "file://")
+		rel := rawTarget
+		if absRoot, err := filepath.Abs(root); err == nil {
+			absSlash := filepath.ToSlash(absRoot)
+			if strings.HasPrefix(rawTarget, absSlash+"/") {
+				rel = strings.TrimPrefix(rawTarget, absSlash+"/")
+			}
+		}
+		if cleanRoot != "." && strings.HasPrefix(rel, cleanRoot+"/") {
+			rel = strings.TrimPrefix(rel, cleanRoot+"/")
+		}
+		rel = strings.TrimPrefix(rel, "./")
+		if _, ok := changedSet[rel]; ok {
+			out = append(out, f)
+		}
+	}
+	return out
+}

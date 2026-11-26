@@ -1,0 +1,12 @@
+{
+  "packages": [
+    {
+      "name": "example/gpl-demo-pkg",
+      "version": "1.2.0",
+      "license": ["GPL-3.0-only"],
+      "dist": {
+        "shasum": "111122223333444455556666777788889999aaaa"
+      }
+    }
+  ]
+}

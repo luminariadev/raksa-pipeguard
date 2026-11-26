@@ -28,6 +28,10 @@ func TestMCPStdioLifecycleAndTools(t *testing.T) {
 			"offline_db": filepath.Join(vulnPath, "offline_osv.json"),
 		}),
 		mustMarshalCall(7, "pipeguard_generate_sbom", map[string]any{"path": vulnPath}),
+		mustMarshalCall(8, "pipeguard_scan_ci_workflow", map[string]any{
+			"content": "stages: [build]\nimage: docker:latest\nvariables:\n  DOCKER_TLS_CERTDIR: \"\"\nservices:\n  - docker:dind\nbuild:\n  script:\n    - echo ok\n",
+			"target":  ".gitlab-ci.yml",
+		}),
 	}
 
 	var out bytes.Buffer
@@ -36,9 +40,9 @@ func TestMCPStdioLifecycleAndTools(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	// 7 ID-bearing requests (notification emits no response).
-	if len(lines) != 7 {
-		t.Fatalf("expected 7 JSON-RPC responses, got %d:\n%s", len(lines), out.String())
+	// 8 ID-bearing requests (notification emits no response).
+	if len(lines) != 8 {
+		t.Fatalf("expected 8 JSON-RPC responses, got %d:\n%s", len(lines), out.String())
 	}
 
 	// Verify initialize + tools/list + rules + IaC inline + hardened score=100 + vuln breach + CycloneDX.
@@ -60,13 +64,18 @@ func TestMCPStdioLifecycleAndTools(t *testing.T) {
 	}
 
 	vulnText := extractToolText(t, lines[5])
-	if !strings.Contains(vulnText, "PIPE-401") || !strings.Contains(vulnText, "CVE-2021-23337") {
-		t.Fatalf("expected vulnerable repo scan to include PIPE-401 and CVE-2021-23337, got:\n%s", vulnText)
+	if !strings.Contains(vulnText, "PIPE-401") || !strings.Contains(vulnText, "CVE-2021-23337") || !strings.Contains(vulnText, "PIPE-105") || !strings.Contains(vulnText, "PIPE-405") {
+		t.Fatalf("expected vulnerable repo scan to include PIPE-401, PIPE-405, PIPE-105, and CVE-2021-23337, got:\n%s", vulnText)
 	}
 
 	sbomText := extractToolText(t, lines[6])
 	if !strings.Contains(sbomText, `"bomFormat": "CycloneDX"`) || !strings.Contains(sbomText, `"lodash"`) {
 		t.Fatalf("expected CycloneDX 1.5 SBOM with lodash, got:\n%s", sbomText)
+	}
+
+	gitlabText := extractToolText(t, lines[7])
+	if !strings.Contains(gitlabText, "PIPE-405") || !strings.Contains(gitlabText, "PIPE-407") {
+		t.Fatalf("expected GitLab CI MCP scan to include PIPE-405 and PIPE-407, got:\n%s", gitlabText)
 	}
 }
 

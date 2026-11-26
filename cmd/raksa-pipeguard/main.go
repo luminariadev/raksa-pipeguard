@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ const (
 	exitOK     = 0
 	exitErr    = 1
 	exitBreach = 2
+	hookMarker = "# raksa-pipeguard managed hook"
 )
 
 func main() {
@@ -54,6 +56,8 @@ func run(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 		return runScanCI(rest, stdout, stderr)
 	case "scan-repo":
 		return runScanRepo(rest, stdout, stderr)
+	case "install-hook":
+		return runInstallHook(rest, stdout, stderr)
 	case "rules":
 		return runRules(rest, stdout, stderr)
 	case "mcp":
@@ -78,46 +82,94 @@ Usage:
   raksa-pipeguard <subcommand> [flags]
 
 Subcommands:
-  scan-secrets   Scan workspace files, staged changes, or git history for leaked secrets
-  scan-deps      Audit lockfiles and dependencies against OSV advisories (offline DB / OSV.dev)
-  sbom           Generate CycloneDX 1.5 JSON SBOM for Go, Node, Rust, and Python dependencies
+  scan-secrets   Scan workspace files, staged changes, PR diff, or git history for secrets
+  scan-deps      Audit lockfiles, dependency licenses, and OSV advisories (cached/offline)
+  sbom           Generate CycloneDX 1.5 JSON SBOM across Go, Node, Rust, Python, PHP, Maven
   scan-iac       Lint Dockerfiles, Kubernetes YAML manifests, and Terraform HCL files
-  scan-ci        Audit GitHub Actions workflows (.github/workflows/*.yml)
-  scan-repo      Run all Layer 4 checks with unified Posture Score and policy waivers
+  scan-ci        Audit GitHub Actions workflows and GitLab CI (.gitlab-ci.yml) pipelines
+  scan-repo      Run all Layer 4 checks, custom rules, baseline diffing, and posture scoring
+  install-hook   Install or remove a managed Git pre-commit staged secret-scanning hook
   rules          List built-in PIPE-* security rules and MITRE D3FEND mappings
   mcp            Start newline-delimited JSON-RPC 2.0 MCP server over stdio (7 tools)
   version        Print build version metadata
 
 Common scan flags:
-  --path <dir|file>   Target path to scan (default ".")
-  --format <fmt>      Output format: table, json, sarif (default "table")
-  --fail-on <sev>     Minimum severity to return exit code 2: critical, high, medium, low, info, none (default "high")
-  --policy <file>     Path to .pipeguard.yml waiver file (auto-discovers <path>/.pipeguard.yml if present)
-  --output <file>     Write output to file instead of stdout
+  --path <dir|file>       Target path to scan (default ".")
+  --format <fmt>          Output format: table, json, sarif (default "table")
+  --fail-on <sev>         Minimum severity for exit code 2: critical, high, medium, low, info, none (default "high")
+  --policy <file>         Path to .pipeguard.yml waiver & custom rule policy (auto-discovers <path>/.pipeguard.yml)
+  --baseline <file>       Suppress known fingerprints recorded in a baseline JSON file
+  --write-baseline <file> Write post-policy findings as a baseline JSON snapshot
+  --diff-base <git-ref>   Restrict findings to files changed since <git-ref> plus PR diff secrets
+  --output <file>         Write output to file instead of stdout
 `, schema.ToolName, schema.Version)
 }
 
 type commonScanFlags struct {
-	path      string
-	format    string
-	failOn    string
-	policy    string
-	output    string
-	outFormat report.OutputFormat
-	threshold schema.Severity
+	path          string
+	format        string
+	failOn        string
+	policy        string
+	baseline      string
+	writeBaseline string
+	diffBase      string
+	output        string
+	outFormat     report.OutputFormat
+	threshold     schema.Severity
 }
 
 func bindCommonFlags(fs *flag.FlagSet, c *commonScanFlags) {
 	fs.StringVar(&c.path, "path", ".", "target path to inspect")
 	fs.StringVar(&c.format, "format", "table", "output format: table, json, sarif")
 	fs.StringVar(&c.failOn, "fail-on", "high", "exit code 2 threshold: critical, high, medium, low, info, none")
-	fs.StringVar(&c.policy, "policy", "", "path to .pipeguard.yml waiver policy")
+	fs.StringVar(&c.policy, "policy", "", "path to .pipeguard.yml waiver and custom rules file")
+	fs.StringVar(&c.baseline, "baseline", "", "suppress known findings from baseline JSON")
+	fs.StringVar(&c.writeBaseline, "write-baseline", "", "save current findings snapshot to baseline JSON")
+	fs.StringVar(&c.diffBase, "diff-base", "", "scope scan to files changed relative to git ref")
 	fs.StringVar(&c.output, "output", "", "write output report to file path")
+}
+
+type boolFlagger interface {
+	IsBoolFlag() bool
+}
+
+// reorderArgs places flags ahead of positional arguments so both `cmd path --flag val` and `cmd --flag val path` parse consistently.
+func reorderArgs(fs *flag.FlagSet, args []string) []string {
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			pos = append(pos, args[i:]...)
+			break
+		}
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			name := strings.TrimLeft(arg, "-")
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				flags = append(flags, arg)
+				continue
+			}
+			f := fs.Lookup(name)
+			isBool := false
+			if f != nil {
+				if bf, ok := f.Value.(boolFlagger); ok && bf.IsBoolFlag() {
+					isBool = true
+				}
+			}
+			flags = append(flags, arg)
+			if f != nil && !isBool && i+1 < len(args) {
+				flags = append(flags, args[i+1])
+				i++
+			}
+			continue
+		}
+		pos = append(pos, arg)
+	}
+	return append(flags, pos...)
 }
 
 func parseFlagsWithHelp(fs *flag.FlagSet, args []string, stdout, stderr io.Writer) (int, bool) {
 	fs.SetOutput(stderr)
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderArgs(fs, args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fs.SetOutput(stdout)
 			fs.PrintDefaults()
@@ -129,9 +181,20 @@ func parseFlagsWithHelp(fs *flag.FlagSet, args []string, stdout, stderr io.Write
 }
 
 func validateCommonFlags(fs *flag.FlagSet, c *commonScanFlags) error {
-	if c.path == "." && fs.NArg() > 0 {
+	pathExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "path" {
+			pathExplicit = true
+		}
+	})
+
+	if fs.NArg() > 1 || (pathExplicit && fs.NArg() > 0) {
+		return fmt.Errorf("unexpected extra positional arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	if !pathExplicit && fs.NArg() == 1 {
 		c.path = fs.Arg(0)
 	}
+
 	outFmt, err := report.ParseFormat(c.format)
 	if err != nil {
 		return err
@@ -150,13 +213,43 @@ func validateCommonFlags(fs *flag.FlagSet, c *commonScanFlags) error {
 	return nil
 }
 
-func finalizeScan(findings []schema.Finding, c commonScanFlags, stdout, stderr io.Writer) int {
-	pol, err := policy.LoadOptionalPolicy(c.path, c.policy)
-	if err != nil {
-		fmt.Fprintf(stderr, "policy error: %v\n", err)
-		return exitErr
+func finalizeScan(findings []schema.Finding, pol *policy.Policy, c commonScanFlags, stdout, stderr io.Writer) int {
+	if pol == nil {
+		loaded, err := policy.LoadOptionalPolicy(c.path, c.policy)
+		if err != nil {
+			fmt.Fprintf(stderr, "policy error: %v\n", err)
+			return exitErr
+		}
+		pol = loaded
 	}
+
+	if strings.TrimSpace(c.diffBase) != "" {
+		changed, err := secrets.ChangedFilesSince(c.path, c.diffBase)
+		if err != nil {
+			fmt.Fprintf(stderr, "diff-base error: %v\n", err)
+			return exitErr
+		}
+		findings = policy.FilterFindingsByChangedFiles(c.path, findings, changed)
+	}
+
 	filtered, _ := policy.ApplyPolicy(findings, pol, time.Now().UTC())
+
+	if strings.TrimSpace(c.baseline) != "" {
+		baseSet, err := policy.LoadBaseline(c.baseline)
+		if err != nil {
+			fmt.Fprintf(stderr, "baseline error: %v\n", err)
+			return exitErr
+		}
+		filtered, _ = policy.FilterBaseline(filtered, baseSet)
+	}
+
+	if strings.TrimSpace(c.writeBaseline) != "" {
+		if err := policy.WriteBaseline(c.writeBaseline, filtered); err != nil {
+			fmt.Fprintf(stderr, "write-baseline error: %v\n", err)
+			return exitErr
+		}
+	}
+
 	rep := schema.NewReport(filtered, time.Now().UTC())
 
 	if strings.TrimSpace(c.output) != "" {
@@ -230,6 +323,14 @@ func runScanSecrets(args []string, stdout, stderr io.Writer) int {
 		}
 		findings = append(findings, stagedHits...)
 	}
+	if strings.TrimSpace(c.diffBase) != "" {
+		diffHits, err := secrets.ScanGitDiffBase(c.path, c.diffBase, opts)
+		if err != nil {
+			fmt.Fprintf(stderr, "scan-secrets diff-base error: %v\n", err)
+			return exitErr
+		}
+		findings = append(findings, diffHits...)
+	}
 	if gitHistory > 0 {
 		histHits, err := secrets.ScanGitHistory(c.path, gitHistory, opts)
 		if err != nil {
@@ -238,7 +339,7 @@ func runScanSecrets(args []string, stdout, stderr io.Writer) int {
 		}
 		findings = append(findings, histHits...)
 	}
-	return finalizeScan(findings, c, stdout, stderr)
+	return finalizeScan(findings, nil, c, stdout, stderr)
 }
 
 func runScanDeps(args []string, stdout, stderr io.Writer) int {
@@ -248,12 +349,16 @@ func runScanDeps(args []string, stdout, stderr io.Writer) int {
 	var online bool
 	var osvURL string
 	var timeoutSec int
+	var noCache bool
+	var cacheDir string
 
 	bindCommonFlags(fs, &c)
 	fs.StringVar(&offlineDB, "offline-db", "", "path to offline OSV advisory JSON file")
 	fs.BoolVar(&online, "online", false, "query live api.osv.dev batch endpoint")
 	fs.StringVar(&osvURL, "osv-url", deps.DefaultOSVBaseURL, "OSV API base URL")
 	fs.IntVar(&timeoutSec, "timeout", 15, "OSV HTTP timeout in seconds")
+	fs.BoolVar(&noCache, "no-cache", false, "disable local OSV disk response cache")
+	fs.StringVar(&cacheDir, "cache-dir", "", "override OSV advisory disk cache directory")
 
 	if code, ok := parseFlagsWithHelp(fs, args, stdout, stderr); !ok {
 		return code
@@ -263,12 +368,25 @@ func runScanDeps(args []string, stdout, stderr io.Writer) int {
 		return exitErr
 	}
 
+	pol, err := policy.LoadOptionalPolicy(c.path, c.policy)
+	if err != nil {
+		fmt.Fprintf(stderr, "policy error: %v\n", err)
+		return exitErr
+	}
+
 	comps, findings, err := deps.InventoryFromPath(c.path)
 	if err != nil {
 		fmt.Fprintf(stderr, "scan-deps inventory error: %v\n", err)
 		return exitErr
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec+5)*time.Second)
+
+	var denied []string
+	if pol != nil {
+		denied = pol.DeniedLicenses
+	}
+	findings = append(findings, deps.AuditLicenses(comps, denied)...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec+10)*time.Second)
 	defer cancel()
 
 	vulnFindings, err := deps.AuditDependencies(ctx, comps, deps.OSVOptions{
@@ -276,13 +394,15 @@ func runScanDeps(args []string, stdout, stderr io.Writer) int {
 		BaseURL:       osvURL,
 		Timeout:       time.Duration(timeoutSec) * time.Second,
 		OfflineDBPath: offlineDB,
+		CacheDir:      cacheDir,
+		NoCache:       noCache,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "scan-deps OSV error: %v\n", err)
 		return exitErr
 	}
 	findings = append(findings, vulnFindings...)
-	return finalizeScan(findings, c, stdout, stderr)
+	return finalizeScan(findings, pol, c, stdout, stderr)
 }
 
 func runSBOM(args []string, stdout, stderr io.Writer) int {
@@ -294,7 +414,17 @@ func runSBOM(args []string, stdout, stderr io.Writer) int {
 	if code, ok := parseFlagsWithHelp(fs, args, stdout, stderr); !ok {
 		return code
 	}
-	if targetPath == "." && fs.NArg() > 0 {
+	pathExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "path" {
+			pathExplicit = true
+		}
+	})
+	if fs.NArg() > 1 || (pathExplicit && fs.NArg() > 0) {
+		fmt.Fprintf(stderr, "unexpected extra positional arguments: %s\n", strings.Join(fs.Args(), " "))
+		return exitErr
+	}
+	if !pathExplicit && fs.NArg() == 1 {
 		targetPath = fs.Arg(0)
 	}
 
@@ -343,7 +473,7 @@ func runScanIaC(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "scan-iac error: %v\n", err)
 		return exitErr
 	}
-	return finalizeScan(findings, c, stdout, stderr)
+	return finalizeScan(findings, nil, c, stdout, stderr)
 }
 
 func runScanCI(args []string, stdout, stderr io.Writer) int {
@@ -364,7 +494,7 @@ func runScanCI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "scan-ci error: %v\n", err)
 		return exitErr
 	}
-	return finalizeScan(findings, c, stdout, stderr)
+	return finalizeScan(findings, nil, c, stdout, stderr)
 }
 
 func runScanRepo(args []string, stdout, stderr io.Writer) int {
@@ -375,6 +505,8 @@ func runScanRepo(args []string, stdout, stderr io.Writer) int {
 	var osvURL string
 	var entropy float64
 	var gitHistory int
+	var noCache bool
+	var cacheDir string
 
 	bindCommonFlags(fs, &c)
 	fs.StringVar(&offlineDB, "offline-db", "", "path to offline OSV advisory JSON file")
@@ -382,12 +514,20 @@ func runScanRepo(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&osvURL, "osv-url", deps.DefaultOSVBaseURL, "OSV API base URL")
 	fs.Float64Var(&entropy, "entropy", secrets.DefaultMinEntropy, "Shannon entropy threshold")
 	fs.IntVar(&gitHistory, "git-history", 0, "scan last N git commits for leaked history secrets")
+	fs.BoolVar(&noCache, "no-cache", false, "disable local OSV disk response cache")
+	fs.StringVar(&cacheDir, "cache-dir", "", "override OSV advisory disk cache directory")
 
 	if code, ok := parseFlagsWithHelp(fs, args, stdout, stderr); !ok {
 		return code
 	}
 	if err := validateCommonFlags(fs, &c); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
+		return exitErr
+	}
+
+	pol, err := policy.LoadOptionalPolicy(c.path, c.policy)
+	if err != nil {
+		fmt.Fprintf(stderr, "policy error: %v\n", err)
 		return exitErr
 	}
 
@@ -399,6 +539,15 @@ func runScanRepo(args []string, stdout, stderr io.Writer) int {
 		return exitErr
 	}
 	allFindings = append(allFindings, secFindings...)
+
+	if strings.TrimSpace(c.diffBase) != "" {
+		diffHits, err := secrets.ScanGitDiffBase(c.path, c.diffBase, secOpts)
+		if err != nil {
+			fmt.Fprintf(stderr, "scan-repo diff-base error: %v\n", err)
+			return exitErr
+		}
+		allFindings = append(allFindings, diffHits...)
+	}
 
 	if gitHistory > 0 {
 		histHits, err := secrets.ScanGitHistory(c.path, gitHistory, secOpts)
@@ -416,13 +565,21 @@ func runScanRepo(args []string, stdout, stderr io.Writer) int {
 	}
 	allFindings = append(allFindings, invFindings...)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	var denied []string
+	if pol != nil {
+		denied = pol.DeniedLicenses
+	}
+	allFindings = append(allFindings, deps.AuditLicenses(comps, denied)...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	vulnFindings, err := deps.AuditDependencies(ctx, comps, deps.OSVOptions{
 		Online:        online,
 		BaseURL:       osvURL,
 		Timeout:       15 * time.Second,
 		OfflineDBPath: offlineDB,
+		CacheDir:      cacheDir,
+		NoCache:       noCache,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "scan-repo OSV error: %v\n", err)
@@ -444,14 +601,109 @@ func runScanRepo(args []string, stdout, stderr io.Writer) int {
 	}
 	allFindings = append(allFindings, ciFindings...)
 
-	return finalizeScan(allFindings, c, stdout, stderr)
+	if pol != nil && len(pol.CustomRules) > 0 {
+		customHits, err := policy.EvaluateCustomRules(c.path, pol)
+		if err != nil {
+			fmt.Fprintf(stderr, "scan-repo custom rules error: %v\n", err)
+			return exitErr
+		}
+		allFindings = append(allFindings, customHits...)
+	}
+
+	return finalizeScan(allFindings, pol, c, stdout, stderr)
+}
+
+func runInstallHook(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("install-hook", flag.ContinueOnError)
+	var repoPath, failOn string
+	var force, uninstall bool
+	fs.StringVar(&repoPath, "path", ".", "git repository path")
+	fs.StringVar(&failOn, "fail-on", "high", "pre-commit fail-on severity threshold")
+	fs.BoolVar(&force, "force", false, "overwrite an existing unmanaged pre-commit hook")
+	fs.BoolVar(&uninstall, "uninstall", false, "remove a raksa-pipeguard managed pre-commit hook")
+
+	if code, ok := parseFlagsWithHelp(fs, args, stdout, stderr); !ok {
+		return code
+	}
+	if fs.NArg() == 1 {
+		repoPath = fs.Arg(0)
+	} else if fs.NArg() > 1 {
+		fmt.Fprintf(stderr, "unexpected extra positional arguments: %s\n", strings.Join(fs.Args(), " "))
+		return exitErr
+	}
+
+	sev, err := schema.ParseSeverity(failOn)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --fail-on value: %v\n", err)
+		return exitErr
+	}
+
+	cmd := exec.Command("git", "-C", repoPath, "rev-parse", "--git-path", "hooks")
+	cmd.Env = append(cmd.Environ(), "GIT_TERMINAL_PROMPT=0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(stderr, "install-hook failed to locate git hooks directory in %q: %v (%s)\n", repoPath, err, strings.TrimSpace(string(out)))
+		return exitErr
+	}
+	hooksDir := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(hooksDir) {
+		hooksDir = filepath.Join(repoPath, hooksDir)
+	}
+	hookPath := filepath.Join(hooksDir, "pre-commit")
+
+	existing, readErr := os.ReadFile(hookPath)
+	exists := readErr == nil
+
+	if uninstall {
+		if !exists {
+			fmt.Fprintf(stdout, "No pre-commit hook found at %s\n", hookPath)
+			return exitOK
+		}
+		if !strings.Contains(string(existing), hookMarker) {
+			fmt.Fprintf(stderr, "refusing to remove %s: hook is not managed by raksa-pipeguard\n", hookPath)
+			return exitErr
+		}
+		if err := os.Remove(hookPath); err != nil {
+			fmt.Fprintf(stderr, "remove pre-commit hook error: %v\n", err)
+			return exitErr
+		}
+		fmt.Fprintf(stdout, "Removed managed pre-commit hook: %s\n", hookPath)
+		return exitOK
+	}
+
+	if exists && !force && !strings.Contains(string(existing), hookMarker) {
+		fmt.Fprintf(stderr, "pre-commit hook already exists at %s; pass --force to overwrite\n", hookPath)
+		return exitErr
+	}
+
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "create hooks dir error: %v\n", err)
+		return exitErr
+	}
+
+	script := fmt.Sprintf(`#!/usr/bin/env sh
+%s
+set -eu
+if command -v raksa-pipeguard >/dev/null 2>&1; then
+  exec raksa-pipeguard scan-secrets --path . --staged --fail-on %s --format table
+fi
+echo "raksa-pipeguard not found in PATH; install binary or uninstall via 'raksa-pipeguard install-hook --uninstall'" >&2
+exit 1
+`, hookMarker, string(sev))
+
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		fmt.Fprintf(stderr, "write pre-commit hook error: %v\n", err)
+		return exitErr
+	}
+	fmt.Fprintf(stdout, "Installed pre-commit secret-scanning hook at %s (fail-on: %s)\n", hookPath, string(sev))
+	return exitOK
 }
 
 func runRules(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("rules", flag.ContinueOnError)
 	var formatStr, moduleFilter string
 	fs.StringVar(&formatStr, "format", "table", "output format: table or json")
-	fs.StringVar(&moduleFilter, "module", "", "optional module filter: secrets, deps, iac, ci")
+	fs.StringVar(&moduleFilter, "module", "", "optional module filter: secrets, deps, iac, ci, policy")
 
 	if code, ok := parseFlagsWithHelp(fs, args, stdout, stderr); !ok {
 		return code

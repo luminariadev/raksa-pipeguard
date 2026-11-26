@@ -201,7 +201,7 @@ func ToolDefinitions() []toolDefinition {
 				"properties": map[string]any{
 					"module": map[string]any{
 						"type":        "string",
-						"description": "Optional module filter: secrets, deps, iac, or ci.",
+						"description": "Optional module filter: secrets, deps, iac, ci, or policy.",
 					},
 				},
 				"additionalProperties": false,
@@ -209,31 +209,35 @@ func ToolDefinitions() []toolDefinition {
 		},
 		{
 			Name:        "pipeguard_scan_secrets",
-			Description: "Scan a workspace path and optionally git commit history for hardcoded credentials, private keys, and high-entropy secrets.",
+			Description: "Scan a workspace path, optional git diff base, and git commit history for hardcoded credentials, private keys, and high-entropy secrets.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"path"},
 				"properties": map[string]any{
 					"path":                map[string]any{"type": "string", "description": "File or repository directory to scan."},
 					"entropy_threshold":   map[string]any{"type": "number", "description": "Shannon entropy threshold (default 4.2)."},
+					"diff_base":           map[string]any{"type": "string", "description": "Optional git base ref (e.g. origin/main) to scan PR diff lines."},
 					"include_git_history": map[string]any{"type": "boolean", "description": "Also scan recent git history commits for PIPE-006."},
 					"git_commits":         map[string]any{"type": "integer", "description": "Maximum git commits to inspect (default 25)."},
 					"policy_path":         map[string]any{"type": "string", "description": "Optional .pipeguard.yml waiver policy path."},
+					"baseline_path":       map[string]any{"type": "string", "description": "Optional baseline JSON path to suppress existing fingerprints."},
 				},
 				"additionalProperties": false,
 			},
 		},
 		{
 			Name:        "pipeguard_scan_deps",
-			Description: "Inventory dependency lockfiles and audit packages against an offline OSV database and/or live OSV.dev API.",
+			Description: "Inventory dependency lockfiles, check SPDX licenses, and audit packages against an offline OSV database and/or cached live OSV.dev API.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"path"},
 				"properties": map[string]any{
-					"path":        map[string]any{"type": "string", "description": "Project directory to inspect."},
-					"offline_db":  map[string]any{"type": "string", "description": "Optional local offline OSV advisory JSON file."},
-					"online":      map[string]any{"type": "boolean", "description": "Query live api.osv.dev batch API (default false)."},
-					"policy_path": map[string]any{"type": "string", "description": "Optional .pipeguard.yml waiver policy path."},
+					"path":          map[string]any{"type": "string", "description": "Project directory to inspect."},
+					"offline_db":    map[string]any{"type": "string", "description": "Optional local offline OSV advisory JSON file."},
+					"online":        map[string]any{"type": "boolean", "description": "Query live api.osv.dev batch API (default false)."},
+					"no_cache":      map[string]any{"type": "boolean", "description": "Bypass local OSV disk cache when online is true."},
+					"policy_path":   map[string]any{"type": "string", "description": "Optional .pipeguard.yml waiver policy path."},
+					"baseline_path": map[string]any{"type": "string", "description": "Optional baseline JSON path to suppress existing fingerprints."},
 				},
 				"additionalProperties": false,
 			},
@@ -267,13 +271,13 @@ func ToolDefinitions() []toolDefinition {
 		},
 		{
 			Name:        "pipeguard_scan_ci_workflow",
-			Description: "Audit GitHub Actions workflows (.github/workflows/*.yml) for pull_request_target misuse, script injection, permissions, and unpinned actions.",
+			Description: "Audit GitHub Actions workflows (.github/workflows/*.yml) and GitLab CI (.gitlab-ci.yml) pipelines for privilege misuse, script injection, secret leaks, and unpinned images/actions.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"path":        map[string]any{"type": "string", "description": "Repository root, .github/workflows dir, or workflow file."},
-					"content":     map[string]any{"type": "string", "description": "Inline GitHub Actions workflow YAML."},
-					"target":      map[string]any{"type": "string", "description": "Logical target path when using content."},
+					"path":        map[string]any{"type": "string", "description": "Repository root, .github/workflows dir, .gitlab-ci.yml, or workflow file."},
+					"content":     map[string]any{"type": "string", "description": "Inline GitHub Actions or GitLab CI YAML."},
+					"target":      map[string]any{"type": "string", "description": "Logical target path when using content (use .gitlab-ci.yml for GitLab CI)."},
 					"policy_path": map[string]any{"type": "string", "description": "Optional .pipeguard.yml waiver policy path."},
 				},
 				"additionalProperties": false,
@@ -281,15 +285,18 @@ func ToolDefinitions() []toolDefinition {
 		},
 		{
 			Name:        "pipeguard_scan_repo",
-			Description: "Run full Layer 4 DevSecOps gate across secrets, dependencies, IaC, and GitHub Actions workflows with posture scoring and optional policy waivers.",
+			Description: "Run full Layer 4 DevSecOps gate across secrets, dependencies/licenses, IaC, CI workflows, custom org rules, baseline diffing, and posture scoring.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"path"},
 				"properties": map[string]any{
 					"path":                map[string]any{"type": "string", "description": "Repository directory to scan."},
-					"policy_path":         map[string]any{"type": "string", "description": "Optional .pipeguard.yml waiver policy path."},
+					"policy_path":         map[string]any{"type": "string", "description": "Optional .pipeguard.yml waiver and custom rules policy path."},
+					"baseline_path":       map[string]any{"type": "string", "description": "Optional baseline JSON file to suppress known fingerprints."},
+					"diff_base":           map[string]any{"type": "string", "description": "Optional git base ref to filter findings to changed files plus PR diff secrets."},
 					"offline_db":          map[string]any{"type": "string", "description": "Optional local offline OSV advisory JSON file."},
 					"online":              map[string]any{"type": "boolean", "description": "Query live api.osv.dev batch API (default false)."},
+					"no_cache":            map[string]any{"type": "boolean", "description": "Disable local OSV disk cache when online is true."},
 					"include_git_history": map[string]any{"type": "boolean", "description": "Scan recent git commits for leaked history secrets."},
 					"git_commits":         map[string]any{"type": "integer", "description": "Max commits when include_git_history is true (default 25)."},
 					"format":              map[string]any{"type": "string", "description": "Output format: json (default), sarif, or table."},
@@ -333,6 +340,14 @@ func executeTool(name string, args map[string]any) toolCallResult {
 		if err != nil {
 			return errToolResult(err.Error())
 		}
+		diffBase := getString(args, "diff_base")
+		if diffBase != "" {
+			diffHits, err := secrets.ScanGitDiffBase(target, diffBase, opts)
+			if err != nil {
+				return errToolResult(err.Error())
+			}
+			findings = append(findings, diffHits...)
+		}
 		if getBool(args, "include_git_history") {
 			commits := getInt(args, "git_commits", 25)
 			histFindings, err := secrets.ScanGitHistory(target, commits, opts)
@@ -341,29 +356,41 @@ func executeTool(name string, args map[string]any) toolCallResult {
 			}
 			findings = append(findings, histFindings...)
 		}
-		return formatToolFindings(findings, target, getString(args, "policy_path"), report.FormatJSON)
+		return formatToolFindings(findings, nil, target, getString(args, "policy_path"), getString(args, "baseline_path"), diffBase, report.FormatJSON)
 
 	case "pipeguard_scan_deps":
 		target := getString(args, "path")
 		if target == "" {
 			return errToolResult("missing required argument: path")
 		}
+		polPath := getString(args, "policy_path")
+		pol, err := policy.LoadOptionalPolicy(target, polPath)
+		if err != nil {
+			return errToolResult(err.Error())
+		}
 		comps, invFindings, err := deps.InventoryFromPath(target)
 		if err != nil {
 			return errToolResult(err.Error())
 		}
+		var denied []string
+		if pol != nil {
+			denied = pol.DeniedLicenses
+		}
+		invFindings = append(invFindings, deps.AuditLicenses(comps, denied)...)
+
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		vulnFindings, err := deps.AuditDependencies(ctx, comps, deps.OSVOptions{
 			Online:        getBool(args, "online"),
 			OfflineDBPath: getString(args, "offline_db"),
 			Timeout:       15 * time.Second,
+			NoCache:       getBool(args, "no_cache"),
 		})
 		if err != nil {
 			return errToolResult(err.Error())
 		}
 		findings := append(invFindings, vulnFindings...)
-		return formatToolFindings(findings, target, getString(args, "policy_path"), report.FormatJSON)
+		return formatToolFindings(findings, pol, target, polPath, getString(args, "baseline_path"), "", report.FormatJSON)
 
 	case "pipeguard_generate_sbom":
 		target := getString(args, "path")
@@ -404,7 +431,7 @@ func executeTool(name string, args map[string]any) toolCallResult {
 		if err != nil {
 			return errToolResult(err.Error())
 		}
-		return formatToolFindings(findings, target, policyPath, report.FormatJSON)
+		return formatToolFindings(findings, nil, target, policyPath, "", "", report.FormatJSON)
 
 	case "pipeguard_scan_ci_workflow":
 		content := getString(args, "content")
@@ -426,7 +453,7 @@ func executeTool(name string, args map[string]any) toolCallResult {
 		if err != nil {
 			return errToolResult(err.Error())
 		}
-		return formatToolFindings(findings, target, policyPath, report.FormatJSON)
+		return formatToolFindings(findings, nil, target, policyPath, "", "", report.FormatJSON)
 
 	case "pipeguard_scan_repo":
 		target := getString(args, "path")
@@ -442,12 +469,27 @@ func executeTool(name string, args map[string]any) toolCallResult {
 			return errToolResult(err.Error())
 		}
 
+		polPath := getString(args, "policy_path")
+		pol, err := policy.LoadOptionalPolicy(target, polPath)
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+
 		secFindings, err := secrets.ScanPath(target, secrets.ScanOptions{})
 		if err != nil {
 			return errToolResult(err.Error())
 		}
 		var allFindings []schema.Finding
 		allFindings = append(allFindings, secFindings...)
+
+		diffBase := getString(args, "diff_base")
+		if diffBase != "" {
+			diffHits, err := secrets.ScanGitDiffBase(target, diffBase, secrets.ScanOptions{})
+			if err != nil {
+				return errToolResult(err.Error())
+			}
+			allFindings = append(allFindings, diffHits...)
+		}
 
 		if getBool(args, "include_git_history") {
 			commits := getInt(args, "git_commits", 25)
@@ -464,12 +506,19 @@ func executeTool(name string, args map[string]any) toolCallResult {
 		}
 		allFindings = append(allFindings, invFindings...)
 
+		var denied []string
+		if pol != nil {
+			denied = pol.DeniedLicenses
+		}
+		allFindings = append(allFindings, deps.AuditLicenses(comps, denied)...)
+
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		vulnFindings, err := deps.AuditDependencies(ctx, comps, deps.OSVOptions{
 			Online:        getBool(args, "online"),
 			OfflineDBPath: getString(args, "offline_db"),
 			Timeout:       15 * time.Second,
+			NoCache:       getBool(args, "no_cache"),
 		})
 		if err != nil {
 			return errToolResult(err.Error())
@@ -488,19 +537,44 @@ func executeTool(name string, args map[string]any) toolCallResult {
 		}
 		allFindings = append(allFindings, ciFindings...)
 
-		return formatToolFindings(allFindings, target, getString(args, "policy_path"), outFormat)
+		if pol != nil && len(pol.CustomRules) > 0 {
+			customHits, err := policy.EvaluateCustomRules(target, pol)
+			if err != nil {
+				return errToolResult(err.Error())
+			}
+			allFindings = append(allFindings, customHits...)
+		}
+
+		return formatToolFindings(allFindings, pol, target, polPath, getString(args, "baseline_path"), diffBase, outFormat)
 
 	default:
 		return errToolResult(fmt.Sprintf("unknown tool: %s", name))
 	}
 }
 
-func formatToolFindings(findings []schema.Finding, scanTarget, explicitPolicy string, format report.OutputFormat) toolCallResult {
-	pol, err := policy.LoadOptionalPolicy(scanTarget, explicitPolicy)
-	if err != nil {
-		return errToolResult(err.Error())
+func formatToolFindings(findings []schema.Finding, pol *policy.Policy, scanTarget, explicitPolicy, baselinePath, diffBase string, format report.OutputFormat) toolCallResult {
+	if pol == nil {
+		loaded, err := policy.LoadOptionalPolicy(scanTarget, explicitPolicy)
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+		pol = loaded
+	}
+	if strings.TrimSpace(diffBase) != "" {
+		changed, err := secrets.ChangedFilesSince(scanTarget, diffBase)
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+		findings = policy.FilterFindingsByChangedFiles(scanTarget, findings, changed)
 	}
 	filtered, _ := policy.ApplyPolicy(findings, pol, time.Now().UTC())
+	if strings.TrimSpace(baselinePath) != "" {
+		baseSet, err := policy.LoadBaseline(baselinePath)
+		if err != nil {
+			return errToolResult(err.Error())
+		}
+		filtered, _ = policy.FilterBaseline(filtered, baseSet)
+	}
 	rep := schema.NewReport(filtered, time.Now().UTC())
 
 	var buf bytes.Buffer

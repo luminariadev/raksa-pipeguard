@@ -1,0 +1,23 @@
+stages:
+  - build
+
+image: docker:latest
+
+include:
+  - remote: "http://insecure.example.invalid/template.yml"
+  - project: "external/pipeline-templates"
+    ref: "main"
+    file: "/build.yml"
+
+variables:
+  DOCKER_TLS_CERTDIR: ""
+  STATIC_DEPLOY_PASSWORD: "DemoHardcodedValueOnly99"
+
+services:
+  - docker:24-dind
+
+build_service:
+  stage: build
+  script:
+    - curl -sSL https://example.invalid/install.sh | sh
+    - printenv

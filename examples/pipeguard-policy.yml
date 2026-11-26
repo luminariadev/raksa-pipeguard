@@ -1,10 +1,24 @@
-# Example .pipeguard.yml fail-closed waiver policy
-# Suppressing noisy low/info checks requires explicit justification and a future ISO date (YYYY-MM-DD).
+# Example .pipeguard.yml fail-closed waiver, license, and custom rules policy
+# Every suppression requires explicit justification and a future ISO date (YYYY-MM-DD).
 
 min_severity: low
+
+denied_licenses:
+  - AGPL
+  - GPL
+  - SSPL
+  - BUSL
 
 suppressions:
   - rule_id: "PIPE-206"
     target_contains: "worker/Dockerfile"
     reason: "Queue worker has no network listener and health is supervised by process runtime"
     expires_on: "2027-06-30"
+
+custom_rules:
+  - id: "ORG-REG-001"
+    title: "Disallow unapproved legacy internal container registry"
+    severity: high
+    pattern: "registry\\.legacy\\.internal"
+    path_glob: "*.yml"
+    remediation: "Migrate container image references to ghcr.io/org-verified."
