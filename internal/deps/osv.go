@@ -79,7 +79,7 @@ func AuditDependencies(ctx context.Context, comps []Component, opts OSVOptions) 
 					continue
 				}
 				seen[key] = struct{}{}
-				findings = append(findings, vulnToFinding(c, adv.ID, adv.Severity, adv.Summary, adv.FixedVersion, now))
+				findings = append(findings, vulnToFinding(c, adv.ID, adv.Severity, adv.Summary, adv.FixedVersion, nil, now))
 			}
 		}
 	}
@@ -135,16 +135,18 @@ type osvPkg struct {
 type osvBatchResp struct {
 	Results []struct {
 		Vulns []struct {
-			ID       string `json:"id"`
-			Summary  string `json:"summary"`
-			Severity string `json:"severity"`
-			Fixed    string `json:"fixed_version"`
+			ID       string   `json:"id"`
+			Aliases  []string `json:"aliases"`
+			Summary  string   `json:"summary"`
+			Severity string   `json:"severity"`
+			Fixed    string   `json:"fixed_version"`
 		} `json:"vulns"`
 	} `json:"results"`
 }
 
 type cachedOSVVuln struct {
 	ID         string            `json:"id"`
+	Aliases    []string          `json:"aliases,omitempty"`
 	Summary    string            `json:"summary"`
 	Severity   string            `json:"severity"`
 	FixedByPkg map[string]string `json:"fixed_by_pkg,omitempty"`
@@ -179,6 +181,7 @@ func QueryOSVBatch(ctx context.Context, comps []Component, opts OSVOptions) ([]s
 	type rawHit struct {
 		comp    Component
 		vulnID  string
+		aliases []string
 		sev     string
 		summary string
 		fixed   string
@@ -239,6 +242,7 @@ func QueryOSVBatch(ctx context.Context, comps []Component, opts OSVOptions) ([]s
 				rawHits = append(rawHits, rawHit{
 					comp:    comp,
 					vulnID:  strings.TrimSpace(v.ID),
+					aliases: v.Aliases,
 					sev:     strings.TrimSpace(v.Severity),
 					summary: strings.TrimSpace(v.Summary),
 					fixed:   strings.TrimSpace(v.Fixed),
@@ -269,7 +273,7 @@ func QueryOSVBatch(ctx context.Context, comps []Component, opts OSVOptions) ([]s
 		if hit.vulnID == "" {
 			continue
 		}
-		if hit.sev != "" && hit.summary != "" && hit.fixed != "" {
+		if hit.sev != "" && hit.summary != "" && hit.fixed != "" && len(hit.aliases) > 0 {
 			continue
 		}
 		if _, done := seenFetch[hit.vulnID]; done {
@@ -301,6 +305,7 @@ func QueryOSVBatch(ctx context.Context, comps []Component, opts OSVOptions) ([]s
 		sev := hit.sev
 		summary := hit.summary
 		fixed := hit.fixed
+		aliases := hit.aliases
 		if det := details[hit.vulnID]; det != nil {
 			if sev == "" {
 				sev = det.Severity
@@ -311,6 +316,9 @@ func QueryOSVBatch(ctx context.Context, comps []Component, opts OSVOptions) ([]s
 			if fixed == "" {
 				fixed = det.fixedFor(hit.comp)
 			}
+			if len(aliases) == 0 && len(det.Aliases) > 0 {
+				aliases = det.Aliases
+			}
 		}
 		if sev == "" {
 			sev = "high"
@@ -318,7 +326,7 @@ func QueryOSVBatch(ctx context.Context, comps []Component, opts OSVOptions) ([]s
 		if summary == "" {
 			summary = fmt.Sprintf("Vulnerability %s affects %s@%s", hit.vulnID, hit.comp.Name, hit.comp.Version)
 		}
-		findings = append(findings, vulnToFinding(hit.comp, hit.vulnID, sev, summary, fixed, now))
+		findings = append(findings, vulnToFinding(hit.comp, hit.vulnID, sev, summary, fixed, aliases, now))
 	}
 
 	return findings, nil
@@ -389,8 +397,9 @@ func fetchSingleOSVVulnDetail(ctx context.Context, client *http.Client, baseURL,
 	}
 
 	var doc struct {
-		ID               string `json:"id"`
-		Summary          string `json:"summary"`
+		ID               string   `json:"id"`
+		Aliases          []string `json:"aliases"`
+		Summary          string   `json:"summary"`
 		DatabaseSpecific struct {
 			Severity string `json:"severity"`
 		} `json:"database_specific"`
@@ -457,6 +466,7 @@ func fetchSingleOSVVulnDetail(ctx context.Context, client *http.Client, baseURL,
 
 	return &cachedOSVVuln{
 		ID:         vulnID,
+		Aliases:    doc.Aliases,
 		Summary:    strings.TrimSpace(doc.Summary),
 		Severity:   sev,
 		FixedByPkg: fixedByPkg,
@@ -521,7 +531,7 @@ func writeCachedOSVVuln(cacheDir, vulnID string, entry *cachedOSVVuln) {
 	}
 }
 
-func vulnToFinding(c Component, vulnID, rawSev, summary, fixedVer string, now time.Time) schema.Finding {
+func vulnToFinding(c Component, vulnID, rawSev, summary, fixedVer string, aliases []string, now time.Time) schema.Finding {
 	sev := mapAdvisorySeverity(rawSev)
 	ruleID := "PIPE-102"
 	if sev == schema.SeverityCritical || sev == schema.SeverityHigh {
@@ -541,6 +551,12 @@ func vulnToFinding(c Component, vulnID, rawSev, summary, fixedVer string, now ti
 		"purl":        c.PURL,
 		"standard":    "OWASP CI/CD-SEC-3",
 	}
+	if len(aliases) > 0 {
+		ev["aliases"] = aliases
+	}
+	if cveID := extractPrimaryCVE(vulnID, aliases); cveID != "" {
+		ev["cve_id"] = cveID
+	}
 	if fixedVer != "" {
 		ev["fixed_version"] = fixedVer
 	}
@@ -559,6 +575,20 @@ func vulnToFinding(c Component, vulnID, rawSev, summary, fixedVer string, now ti
 		fmt.Sprintf("%s-%s-%s", c.Name, c.Version, vulnID),
 		now,
 	)
+}
+
+func extractPrimaryCVE(vulnID string, aliases []string) string {
+	up := strings.ToUpper(strings.TrimSpace(vulnID))
+	if strings.HasPrefix(up, "CVE-") {
+		return up
+	}
+	for _, a := range aliases {
+		ca := strings.ToUpper(strings.TrimSpace(a))
+		if strings.HasPrefix(ca, "CVE-") {
+			return ca
+		}
+	}
+	return ""
 }
 
 func mapAdvisorySeverity(raw string) schema.Severity {

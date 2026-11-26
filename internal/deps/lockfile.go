@@ -66,10 +66,11 @@ func InventoryFromPath(root string) ([]Component, []schema.Finding, error) {
 	sort.Strings(files)
 
 	var (
-		comps    []Component
-		findings []schema.Finding
-		seenPURL = make(map[string]struct{})
-		now      = time.Now().UTC()
+		comps         []Component
+		manifestComps []Component
+		findings      []schema.Finding
+		seenPURL      = make(map[string]struct{})
+		now           = time.Now().UTC()
 	)
 
 	addComp := func(c Component) {
@@ -119,6 +120,7 @@ func InventoryFromPath(root string) ([]Component, []schema.Finding, error) {
 			unpinned, hasAnyDeps := inspectPackageJSON(raw, target, now)
 			findings = append(findings, unpinned...)
 			if hasAnyDeps && !hasLock {
+				manifestComps = append(manifestComps, parsePackageJSONManifest(raw, target)...)
 				findings = append(findings, schema.NewFinding(
 					"PIPE-104", "deps", schema.SeverityLow,
 					"Missing Node.js lockfile for declared dependencies",
@@ -219,6 +221,11 @@ func InventoryFromPath(root string) ([]Component, []schema.Finding, error) {
 			}
 			findings = append(findings, pomFindings...)
 		}
+	}
+
+	// Add manifest-only fallback components only if lockfiles did not already resolve that package.
+	for _, mc := range manifestComps {
+		addComp(mc)
 	}
 
 	sort.Slice(comps, func(i, j int) bool {
@@ -342,6 +349,50 @@ func inspectPackageJSON(raw string, target string, now time.Time) ([]schema.Find
 	checkMap(doc.Dependencies)
 	checkMap(doc.DevDependencies)
 	return findings, totalDeps > 0
+}
+
+func parsePackageJSONManifest(raw string, target string) []Component {
+	var doc struct {
+		Dependencies    map[string]string `json:"dependencies"`
+		DevDependencies map[string]string `json:"devDependencies"`
+	}
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		return nil
+	}
+
+	var comps []Component
+	addMap := func(m map[string]string) {
+		for pkg, spec := range m {
+			clean := cleanNPMSemverSpec(spec)
+			if clean == "" {
+				continue
+			}
+			comps = append(comps, makeNpmComponent(pkg, clean, "", target))
+		}
+	}
+	addMap(doc.Dependencies)
+	addMap(doc.DevDependencies)
+	return comps
+}
+
+func cleanNPMSemverSpec(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" || strings.ContainsAny(s, " *<>|xX") {
+		return ""
+	}
+	low := strings.ToLower(s)
+	if low == "latest" || low == "next" || strings.HasPrefix(low, "git+") ||
+		strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://") ||
+		strings.HasPrefix(low, "github:") || strings.HasPrefix(low, "file:") ||
+		strings.HasPrefix(low, "workspace:") || strings.HasPrefix(low, "npm:") {
+		return ""
+	}
+	s = strings.TrimLeft(s, "^~=")
+	s = strings.TrimSpace(s)
+	if s == "" || s[0] < '0' || s[0] > '9' {
+		return ""
+	}
+	return s
 }
 
 func parsePackageLockJSON(raw string, target string) []Component {

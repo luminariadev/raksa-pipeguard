@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/luminariadev/raksa-pipeguard/internal/schema"
 )
 
 func TestInventoryCycloneDXAndUnpinnedFindings(t *testing.T) {
@@ -274,5 +276,102 @@ version = "0.27.0"
 	}
 	if detailCalls != 1 {
 		t.Fatalf("expected cache hit with 0 extra HTTP detail calls, total=%d", detailCalls)
+	}
+}
+
+func TestManifestFallbackKEVEPSSSPDXAndSBOMDiff(t *testing.T) {
+	dir := t.TempDir()
+	// 1. package.json without lockfile still extracts pinned components for OSV auditing.
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"dependencies":{"lodash":"4.17.20","caret":"^1.2.3"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	comps, invFindings, err := InventoryFromPath(dir)
+	if err != nil {
+		t.Fatalf("InventoryFromPath manifest fallback: %v", err)
+	}
+	if len(comps) != 2 || len(invFindings) != 1 || invFindings[0].RuleID != "PIPE-104" {
+		t.Fatalf("expected 2 fallback components and 1 PIPE-104 finding, got comps=%+v inv=%+v", comps, invFindings)
+	}
+
+	// 2. CISA KEV offline + mock EPSS upgrades advisory with CVE alias to critical PIPE-106.
+	kevPath := filepath.Join(dir, "kev.json")
+	if err := os.WriteFile(kevPath, []byte(`{"vulnerabilities":[{"cveID":"CVE-2021-23337","vulnerabilityName":"Lodash Prototype Command Injection"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	epssSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"cve":"CVE-2024-9999","epss":"0.87500","percentile":"0.99100"}]}`))
+	}))
+	defer epssSrv.Close()
+
+	osvHits, _ := AuditDependencies(context.Background(), comps, OSVOptions{
+		OfflineDBPath: filepath.Join("..", "..", "testdata", "vulnerable", "offline_osv.json"),
+	})
+	if len(osvHits) != 1 {
+		t.Fatalf("expected offline advisory for lodash@4.17.20, got %+v", osvHits)
+	}
+
+	// Add second synthetic GHSA finding carrying CVE alias to test EPSS escalation independently of KEV.
+	ghsaOnly := osvHits[0]
+	ghsaOnly.ID = "pipe-102-caret-ghsa-1"
+	ghsaOnly.RuleID = "PIPE-102"
+	ghsaOnly.Severity = "medium"
+	ghsaOnly.Evidence = map[string]any{
+		"advisory_id": "GHSA-epss-demo",
+		"aliases":     []string{"CVE-2024-9999"},
+		"package":     "caret",
+		"version":     "1.2.3",
+	}
+
+	enriched, err := EnrichFindingsWithRisk(context.Background(), []schema.Finding{osvHits[0], ghsaOnly}, RiskOptions{
+		KEVPath:    kevPath,
+		OnlineEPSS: true,
+		EPSSURL:    epssSrv.URL,
+		NoCache:    true,
+	})
+	if err != nil {
+		t.Fatalf("EnrichFindingsWithRisk failed: %v", err)
+	}
+	if len(enriched) != 2 || enriched[0].RuleID != "PIPE-106" || enriched[0].Evidence["kev"] != true {
+		t.Fatalf("expected KEV escalation to PIPE-106 critical, got %+v", enriched[0])
+	}
+	if enriched[1].RuleID != "PIPE-106" || enriched[1].Severity != "critical" {
+		t.Fatalf("expected EPSS >= 0.50 escalation to PIPE-106 critical, got %+v", enriched[1])
+	}
+
+	// 3. SPDX 2.3 generation + cross-format CycloneDX vs SPDX diff.
+	oldComps := []Component{
+		{Ecosystem: "npm", Name: "lodash", Version: "4.17.20", PURL: "pkg:npm/lodash@4.17.20", License: "MIT"},
+		{Ecosystem: "npm", Name: "legacy", Version: "1.0.0", PURL: "pkg:npm/legacy@1.0.0", License: "MIT"},
+	}
+	newComps := []Component{
+		{Ecosystem: "npm", Name: "lodash", Version: "4.17.21", PURL: "pkg:npm/lodash@4.17.21", License: "MIT"},
+		{Ecosystem: "npm", Name: "copyleft", Version: "2.0.0", PURL: "pkg:npm/copyleft@2.0.0", License: "GPL-3.0-only"},
+	}
+
+	cdxStr, err := GenerateCycloneDX(dir, oldComps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spdxStr, err := GenerateSPDX(dir, newComps)
+	if err != nil || !strings.Contains(spdxStr, `"spdxVersion": "SPDX-2.3"`) || !strings.Contains(spdxStr, `"GPL-3.0-only"`) {
+		t.Fatalf("unexpected SPDX 2.3 output: err=%v spdx=%s", err, spdxStr)
+	}
+
+	oldPath := filepath.Join(dir, "old.cdx.json")
+	newPath := filepath.Join(dir, "new.spdx.json")
+	_ = os.WriteFile(oldPath, []byte(cdxStr), 0o600)
+	_ = os.WriteFile(newPath, []byte(spdxStr), 0o600)
+
+	diff, err := DiffSBOMFiles(oldPath, newPath)
+	if err != nil {
+		t.Fatalf("DiffSBOMFiles failed: %v", err)
+	}
+	if len(diff.Added) != 1 || len(diff.Removed) != 1 || len(diff.VersionChanged) != 1 {
+		t.Fatalf("unexpected cross-format SBOM diff: %+v", diff)
+	}
+	mdDiff, err := FormatSBOMDiff(diff, "markdown")
+	if err != nil || !strings.Contains(mdDiff, "### SBOM Diff Summary") {
+		t.Fatalf("FormatSBOMDiff markdown failed: err=%v out=%s", err, mdDiff)
 	}
 }
