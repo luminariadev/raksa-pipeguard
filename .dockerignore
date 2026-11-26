@@ -1,0 +1,9 @@
+.git
+bin
+dist
+*.exe
+*.sarif
+testdata
+examples
+docs
+*.md
