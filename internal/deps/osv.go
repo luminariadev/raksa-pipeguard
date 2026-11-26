@@ -7,19 +7,30 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/luminariadev/raksa-pipeguard/internal/schema"
 )
 
-const DefaultOSVBaseURL = "https://api.osv.dev"
+const (
+	DefaultOSVBaseURL  = "https://api.osv.dev"
+	DefaultOSVCacheTTL = 6 * time.Hour
+	maxOSVWorkers      = 8
+)
 
 type OSVOptions struct {
 	Online        bool
 	BaseURL       string
 	Timeout       time.Duration
 	OfflineDBPath string
+	CacheDir      string
+	CacheTTL      time.Duration
+	NoCache       bool
 }
 
 type OfflineVulnDB struct {
@@ -132,6 +143,28 @@ type osvBatchResp struct {
 	} `json:"results"`
 }
 
+type cachedOSVVuln struct {
+	ID         string            `json:"id"`
+	Summary    string            `json:"summary"`
+	Severity   string            `json:"severity"`
+	FixedByPkg map[string]string `json:"fixed_by_pkg,omitempty"`
+	FirstFixed string            `json:"first_fixed,omitempty"`
+	FetchedAt  time.Time         `json:"fetched_at"`
+}
+
+func (c *cachedOSVVuln) fixedFor(comp Component) string {
+	if c == nil {
+		return ""
+	}
+	if len(c.FixedByPkg) > 0 {
+		key := strings.ToLower(strings.TrimSpace(comp.Ecosystem)) + ":" + strings.ToLower(strings.TrimSpace(comp.Name))
+		if fv, ok := c.FixedByPkg[key]; ok && fv != "" {
+			return fv
+		}
+	}
+	return c.FirstFixed
+}
+
 func QueryOSVBatch(ctx context.Context, comps []Component, opts OSVOptions) ([]schema.Finding, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/")
 	if baseURL == "" {
@@ -143,8 +176,14 @@ func QueryOSVBatch(ctx context.Context, comps []Component, opts OSVOptions) ([]s
 	}
 
 	client := &http.Client{Timeout: timeout}
-	var findings []schema.Finding
-	now := time.Now().UTC()
+	type rawHit struct {
+		comp    Component
+		vulnID  string
+		sev     string
+		summary string
+		fixed   string
+	}
+	var rawHits []rawHit
 
 	const batchSize = 100
 	for start := 0; start < len(comps); start += batchSize {
@@ -197,62 +236,289 @@ func QueryOSVBatch(ctx context.Context, comps []Component, opts OSVOptions) ([]s
 			}
 			comp := chunk[idx]
 			for _, v := range res.Vulns {
-				sev := strings.TrimSpace(v.Severity)
-				summary := strings.TrimSpace(v.Summary)
-				if sev == "" || summary == "" {
-					fetchedSev, fetchedSum := fetchOSVVulnDetail(ctx, client, baseURL, v.ID)
-					if sev == "" {
-						sev = fetchedSev
-					}
-					if summary == "" {
-						summary = fetchedSum
-					}
-				}
-				if sev == "" {
-					sev = "high"
-				}
-				if summary == "" {
-					summary = fmt.Sprintf("Vulnerability %s affects %s@%s", v.ID, comp.Name, comp.Version)
-				}
-				findings = append(findings, vulnToFinding(comp, v.ID, sev, summary, v.Fixed, now))
+				rawHits = append(rawHits, rawHit{
+					comp:    comp,
+					vulnID:  strings.TrimSpace(v.ID),
+					sev:     strings.TrimSpace(v.Severity),
+					summary: strings.TrimSpace(v.Summary),
+					fixed:   strings.TrimSpace(v.Fixed),
+				})
 			}
 		}
+	}
+
+	if len(rawHits) == 0 {
+		return nil, nil
+	}
+
+	cacheDir := ""
+	if !opts.NoCache {
+		cacheDir = resolveOSVCacheDir(opts.CacheDir)
+	}
+	ttl := opts.CacheTTL
+	if ttl <= 0 {
+		ttl = DefaultOSVCacheTTL
+	}
+
+	details := make(map[string]*cachedOSVVuln)
+	var toFetch []string
+	seenFetch := make(map[string]struct{})
+	now := time.Now().UTC()
+
+	for _, hit := range rawHits {
+		if hit.vulnID == "" {
+			continue
+		}
+		if hit.sev != "" && hit.summary != "" && hit.fixed != "" {
+			continue
+		}
+		if _, done := seenFetch[hit.vulnID]; done {
+			continue
+		}
+		seenFetch[hit.vulnID] = struct{}{}
+
+		if cacheDir != "" {
+			if cached := readCachedOSVVuln(cacheDir, hit.vulnID, ttl, now); cached != nil {
+				details[hit.vulnID] = cached
+				continue
+			}
+		}
+		toFetch = append(toFetch, hit.vulnID)
+	}
+
+	if len(toFetch) > 0 {
+		fetched := fetchOSVVulnsParallel(ctx, client, baseURL, toFetch, now)
+		for id, det := range fetched {
+			details[id] = det
+			if cacheDir != "" {
+				writeCachedOSVVuln(cacheDir, id, det)
+			}
+		}
+	}
+
+	findings := make([]schema.Finding, 0, len(rawHits))
+	for _, hit := range rawHits {
+		sev := hit.sev
+		summary := hit.summary
+		fixed := hit.fixed
+		if det := details[hit.vulnID]; det != nil {
+			if sev == "" {
+				sev = det.Severity
+			}
+			if summary == "" {
+				summary = det.Summary
+			}
+			if fixed == "" {
+				fixed = det.fixedFor(hit.comp)
+			}
+		}
+		if sev == "" {
+			sev = "high"
+		}
+		if summary == "" {
+			summary = fmt.Sprintf("Vulnerability %s affects %s@%s", hit.vulnID, hit.comp.Name, hit.comp.Version)
+		}
+		findings = append(findings, vulnToFinding(hit.comp, hit.vulnID, sev, summary, fixed, now))
 	}
 
 	return findings, nil
 }
 
-func fetchOSVVulnDetail(ctx context.Context, client *http.Client, baseURL, vulnID string) (string, string) {
+func fetchOSVVulnsParallel(ctx context.Context, client *http.Client, baseURL string, vulnIDs []string, now time.Time) map[string]*cachedOSVVuln {
+	out := make(map[string]*cachedOSVVuln, len(vulnIDs))
+	if len(vulnIDs) == 0 {
+		return out
+	}
+
+	workers := maxOSVWorkers
+	if len(vulnIDs) < workers {
+		workers = len(vulnIDs)
+	}
+
+	jobs := make(chan string, len(vulnIDs))
+	for _, id := range vulnIDs {
+		jobs <- id
+	}
+	close(jobs)
+
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for vulnID := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				det := fetchSingleOSVVulnDetail(ctx, client, baseURL, vulnID, now)
+				if det != nil {
+					mu.Lock()
+					out[vulnID] = det
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
+func fetchSingleOSVVulnDetail(ctx context.Context, client *http.Client, baseURL, vulnID string, now time.Time) *cachedOSVVuln {
 	if vulnID == "" {
-		return "", ""
+		return nil
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/vulns/"+vulnID, nil)
 	if err != nil {
-		return "", ""
+		return nil
 	}
 	req.Header.Set("User-Agent", schema.ToolName+"/"+schema.Version)
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", ""
+		return nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", ""
+		return nil
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	if err != nil {
-		return "", ""
+		return nil
 	}
+
 	var doc struct {
+		ID               string `json:"id"`
 		Summary          string `json:"summary"`
 		DatabaseSpecific struct {
 			Severity string `json:"severity"`
 		} `json:"database_specific"`
+		Severity []struct {
+			Type  string `json:"type"`
+			Score string `json:"score"`
+		} `json:"severity"`
+		Affected []struct {
+			Package struct {
+				Ecosystem string `json:"ecosystem"`
+				Name      string `json:"name"`
+			} `json:"package"`
+			Ranges []struct {
+				Events []struct {
+					Fixed string `json:"fixed,omitempty"`
+				} `json:"events"`
+			} `json:"ranges"`
+		} `json:"affected"`
 	}
 	if json.Unmarshal(raw, &doc) != nil {
-		return "", ""
+		return nil
 	}
-	return strings.ToLower(strings.TrimSpace(doc.DatabaseSpecific.Severity)), strings.TrimSpace(doc.Summary)
+
+	sev := strings.ToLower(strings.TrimSpace(doc.DatabaseSpecific.Severity))
+	if sev == "" {
+		for _, s := range doc.Severity {
+			if scoreNum, err := strconv.ParseFloat(strings.TrimSpace(s.Score), 64); err == nil {
+				switch {
+				case scoreNum >= 9.0:
+					sev = "critical"
+				case scoreNum >= 7.0:
+					sev = "high"
+				case scoreNum >= 4.0:
+					sev = "medium"
+				case scoreNum > 0:
+					sev = "low"
+				}
+				if sev != "" {
+					break
+				}
+			}
+		}
+	}
+
+	fixedByPkg := make(map[string]string)
+	firstFixed := ""
+	for _, aff := range doc.Affected {
+		pkgKey := strings.ToLower(strings.TrimSpace(aff.Package.Ecosystem)) + ":" + strings.ToLower(strings.TrimSpace(aff.Package.Name))
+		for _, r := range aff.Ranges {
+			for _, ev := range r.Events {
+				fv := strings.TrimSpace(ev.Fixed)
+				if fv == "" {
+					continue
+				}
+				if firstFixed == "" {
+					firstFixed = fv
+				}
+				if aff.Package.Name != "" && fixedByPkg[pkgKey] == "" {
+					fixedByPkg[pkgKey] = fv
+				}
+			}
+		}
+	}
+
+	return &cachedOSVVuln{
+		ID:         vulnID,
+		Summary:    strings.TrimSpace(doc.Summary),
+		Severity:   sev,
+		FixedByPkg: fixedByPkg,
+		FirstFixed: firstFixed,
+		FetchedAt:  now,
+	}
+}
+
+func resolveOSVCacheDir(explicit string) string {
+	dir := strings.TrimSpace(explicit)
+	if dir == "" {
+		base, err := os.UserCacheDir()
+		if err != nil || strings.TrimSpace(base) == "" {
+			return ""
+		}
+		dir = filepath.Join(base, schema.ToolName, "osv")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return ""
+	}
+	return dir
+}
+
+func readCachedOSVVuln(cacheDir, vulnID string, ttl time.Duration, now time.Time) *cachedOSVVuln {
+	p := filepath.Join(cacheDir, schema.SanitizeIDPart(vulnID)+".json")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var entry cachedOSVVuln
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return nil
+	}
+	if entry.FetchedAt.IsZero() || now.Sub(entry.FetchedAt) > ttl {
+		return nil
+	}
+	return &entry
+}
+
+func writeCachedOSVVuln(cacheDir, vulnID string, entry *cachedOSVVuln) {
+	if entry == nil || cacheDir == "" || vulnID == "" {
+		return
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	target := filepath.Join(cacheDir, schema.SanitizeIDPart(vulnID)+".json")
+	tmp, err := os.CreateTemp(cacheDir, ".tmp-osv-*.json")
+	if err != nil {
+		return
+	}
+	tmpPath := tmp.Name()
+	_, wErr := tmp.Write(data)
+	cErr := tmp.Close()
+	if wErr != nil || cErr != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		_ = os.Remove(tmpPath)
+	}
 }
 
 func vulnToFinding(c Component, vulnID, rawSev, summary, fixedVer string, now time.Time) schema.Finding {

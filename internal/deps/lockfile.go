@@ -2,6 +2,7 @@ package deps
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"io/fs"
@@ -10,11 +11,16 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/luminariadev/raksa-pipeguard/internal/schema"
+	"gopkg.in/yaml.v3"
 )
 
 const MaxDepsFileBytes = 4 * 1024 * 1024
+
+// DefaultDeniedLicenses lists restrictive copyleft/source-available license prefixes flagged by PIPE-105.
+var DefaultDeniedLicenses = []string{"AGPL", "GPL", "SSPL", "BUSL"}
 
 type Component struct {
 	Ecosystem    string `json:"ecosystem"`
@@ -24,6 +30,7 @@ type Component struct {
 	ManifestPath string `json:"manifest_path"`
 	HashAlg      string `json:"hash_alg,omitempty"`
 	HashValue    string `json:"hash_value,omitempty"`
+	License      string `json:"license,omitempty"`
 	Line         int    `json:"line,omitempty"`
 }
 
@@ -129,6 +136,16 @@ func InventoryFromPath(root string) ([]Component, []schema.Finding, error) {
 				addComp(c)
 			}
 
+		case "yarn.lock":
+			for _, c := range parseYarnLock(raw, target) {
+				addComp(c)
+			}
+
+		case "pnpm-lock.yaml":
+			for _, c := range parsePnpmLockYAML(raw, target) {
+				addComp(c)
+			}
+
 		case "cargo.toml":
 			hasLock := fileExists(filepath.Join(dir, "Cargo.lock"))
 			unpinned, hasAnyDeps := inspectCargoToml(raw, target, now)
@@ -156,6 +173,51 @@ func InventoryFromPath(root string) ([]Component, []schema.Finding, error) {
 				addComp(c)
 			}
 			findings = append(findings, reqFindings...)
+
+		case "pyproject.toml":
+			hasPyLock := fileExists(filepath.Join(dir, "poetry.lock")) || fileExists(filepath.Join(dir, "uv.lock"))
+			if pyprojectDeclaresDeps(raw) && !hasPyLock {
+				findings = append(findings, schema.NewFinding(
+					"PIPE-104", "deps", schema.SeverityLow,
+					"Missing Python lockfile (poetry.lock or uv.lock) for pyproject.toml",
+					"pyproject.toml declares Python dependencies without a companion poetry.lock or uv.lock lockfile.",
+					target,
+					map[string]any{"ecosystem": "PyPI", "standard": "SLSA Build L2"},
+					"Generate and commit poetry.lock or uv.lock for reproducible dependency resolution.",
+					"D3-SBOM", fmt.Sprintf("%s-missing-pylock", sanitizeBase(f)), now,
+				))
+			}
+
+		case "poetry.lock", "uv.lock":
+			for _, c := range parsePythonLock(raw, target) {
+				addComp(c)
+			}
+
+		case "composer.json":
+			hasLock := fileExists(filepath.Join(dir, "composer.lock"))
+			if composerDeclaresDeps(raw) && !hasLock {
+				findings = append(findings, schema.NewFinding(
+					"PIPE-104", "deps", schema.SeverityLow,
+					"Missing composer.lock for PHP dependencies",
+					"composer.json declares Packagist dependencies without a committed composer.lock file.",
+					target,
+					map[string]any{"ecosystem": "Packagist", "standard": "SLSA Build L2"},
+					"Run 'composer update --lock' or 'composer install' and commit composer.lock.",
+					"D3-SBOM", fmt.Sprintf("%s-missing-composerlock", sanitizeBase(f)), now,
+				))
+			}
+
+		case "composer.lock":
+			for _, c := range parseComposerLock(raw, target) {
+				addComp(c)
+			}
+
+		case "pom.xml":
+			parsed, pomFindings := parsePomXML(raw, target, now)
+			for _, c := range parsed {
+				addComp(c)
+			}
+			findings = append(findings, pomFindings...)
 		}
 	}
 
@@ -287,6 +349,7 @@ func parsePackageLockJSON(raw string, target string) []Component {
 		Packages map[string]struct {
 			Version   string `json:"version"`
 			Integrity string `json:"integrity"`
+			License   string `json:"license"`
 		} `json:"packages"`
 		Dependencies map[string]struct {
 			Version   string `json:"version"`
@@ -310,7 +373,9 @@ func parsePackageLockJSON(raw string, target string) []Component {
 		if name == "" {
 			continue
 		}
-		comps = append(comps, makeNpmComponent(name, meta.Version, meta.Integrity, target))
+		c := makeNpmComponent(name, meta.Version, meta.Integrity, target)
+		c.License = strings.TrimSpace(meta.License)
+		comps = append(comps, c)
 	}
 
 	if len(comps) == 0 {
@@ -381,27 +446,17 @@ func inspectCargoToml(raw string, target string, now time.Time) ([]schema.Findin
 	return findings, hasAny
 }
 
-func parseCargoLock(raw string, target string) []Component {
-	var comps []Component
+func parseTOMLPackageBlocks(raw string, emit func(name, ver, checksum string, isLocal bool)) {
 	var curName, curVer, curSum string
+	var isLocal bool
 	inPkg := false
 
 	flush := func() {
 		if inPkg && curName != "" && curVer != "" {
-			c := Component{
-				Ecosystem:    "crates.io",
-				Name:         curName,
-				Version:      curVer,
-				PURL:         fmt.Sprintf("pkg:cargo/%s@%s", curName, curVer),
-				ManifestPath: target,
-			}
-			if curSum != "" {
-				c.HashAlg = "SHA-256"
-				c.HashValue = curSum
-			}
-			comps = append(comps, c)
+			emit(curName, curVer, curSum, isLocal)
 		}
 		curName, curVer, curSum = "", "", ""
+		isLocal = false
 	}
 
 	for _, rawLine := range strings.Split(raw, "\n") {
@@ -411,19 +466,418 @@ func parseCargoLock(raw string, target string) []Component {
 			inPkg = true
 			continue
 		}
+		if strings.HasPrefix(line, "[") && line != "[[package]]" {
+			flush()
+			inPkg = false
+			continue
+		}
 		if !inPkg || line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if strings.HasPrefix(line, "name = ") {
+		switch {
+		case strings.HasPrefix(line, "name = "):
 			curName = strings.Trim(strings.TrimPrefix(line, "name = "), `"`)
-		} else if strings.HasPrefix(line, "version = ") {
+		case strings.HasPrefix(line, "version = "):
 			curVer = strings.Trim(strings.TrimPrefix(line, "version = "), `"`)
-		} else if strings.HasPrefix(line, "checksum = ") {
+		case strings.HasPrefix(line, "checksum = "):
 			curSum = strings.Trim(strings.TrimPrefix(line, "checksum = "), `"`)
+		case strings.HasPrefix(line, "source = ") && (strings.Contains(line, `virtual = "."`) || strings.Contains(line, `editable = "."`)):
+			isLocal = true
+		}
+	}
+	flush()
+}
+
+func parseCargoLock(raw string, target string) []Component {
+	var comps []Component
+	parseTOMLPackageBlocks(raw, func(name, ver, checksum string, _ bool) {
+		c := Component{
+			Ecosystem:    "crates.io",
+			Name:         name,
+			Version:      ver,
+			PURL:         fmt.Sprintf("pkg:cargo/%s@%s", name, ver),
+			ManifestPath: target,
+		}
+		if checksum != "" {
+			c.HashAlg = "SHA-256"
+			c.HashValue = checksum
+		}
+		comps = append(comps, c)
+	})
+	return comps
+}
+
+func parsePythonLock(raw string, target string) []Component {
+	var comps []Component
+	parseTOMLPackageBlocks(raw, func(name, ver, _ string, isLocal bool) {
+		if isLocal {
+			return
+		}
+		normName := strings.ToLower(strings.ReplaceAll(name, "_", "-"))
+		comps = append(comps, Component{
+			Ecosystem:    "PyPI",
+			Name:         normName,
+			Version:      ver,
+			PURL:         fmt.Sprintf("pkg:pypi/%s@%s", normName, ver),
+			ManifestPath: target,
+		})
+	})
+	return comps
+}
+
+func parseYarnLock(raw string, target string) []Component {
+	var comps []Component
+	var curName, curVer, curIntegrity string
+	inEntry := false
+
+	flush := func() {
+		if inEntry && curName != "" && curVer != "" {
+			comps = append(comps, makeNpmComponent(curName, curVer, curIntegrity, target))
+		}
+		curName, curVer, curIntegrity = "", "", ""
+		inEntry = false
+	}
+
+	for _, rawLine := range strings.Split(raw, "\n") {
+		trimmedRight := strings.TrimRight(rawLine, "\r")
+		trimmed := strings.TrimSpace(trimmedRight)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		// Top-level stanza header ends with ':' and has no leading indentation.
+		if trimmedRight[0] != ' ' && trimmedRight[0] != '\t' && strings.HasSuffix(trimmed, ":") {
+			flush()
+			header := strings.TrimSuffix(trimmed, ":")
+			if header == "__metadata" {
+				continue
+			}
+			firstSpec := strings.TrimSpace(strings.SplitN(header, ",", 2)[0])
+			firstSpec = strings.Trim(firstSpec, `"'`)
+			if at := strings.LastIndex(firstSpec, "@"); at > 0 {
+				curName = firstSpec[:at]
+				inEntry = true
+			}
+			continue
+		}
+		if !inEntry {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "version ") {
+			curVer = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "version ")), `"'`)
+		} else if strings.HasPrefix(trimmed, "version:") {
+			curVer = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "version:")), `"'`)
+		} else if strings.HasPrefix(trimmed, "integrity ") {
+			curIntegrity = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "integrity ")), `"'`)
 		}
 	}
 	flush()
 	return comps
+}
+
+func parsePnpmLockYAML(raw string, target string) []Component {
+	var doc struct {
+		Packages map[string]struct {
+			Resolution struct {
+				Integrity string `yaml:"integrity"`
+			} `yaml:"resolution"`
+		} `yaml:"packages"`
+		Snapshots map[string]struct{} `yaml:"snapshots"`
+	}
+	if err := yaml.Unmarshal([]byte(raw), &doc); err != nil {
+		return nil
+	}
+
+	var comps []Component
+	parseKey := func(pkgKey, integrity string) {
+		k := strings.TrimPrefix(strings.TrimSpace(pkgKey), "/")
+		if paren := strings.IndexByte(k, '('); paren > 0 {
+			k = k[:paren]
+		}
+		var name, ver string
+		if at := strings.LastIndex(k, "@"); at > 0 {
+			name = k[:at]
+			ver = k[at+1:]
+		} else if slash := strings.LastIndex(k, "/"); slash > 0 {
+			name = k[:slash]
+			ver = k[slash+1:]
+		}
+		if name != "" && ver != "" {
+			comps = append(comps, makeNpmComponent(name, ver, integrity, target))
+		}
+	}
+
+	keys := make([]string, 0, len(doc.Packages))
+	for k := range doc.Packages {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		parseKey(k, doc.Packages[k].Resolution.Integrity)
+	}
+	if len(comps) == 0 && len(doc.Snapshots) > 0 {
+		skeys := make([]string, 0, len(doc.Snapshots))
+		for k := range doc.Snapshots {
+			skeys = append(skeys, k)
+		}
+		sort.Strings(skeys)
+		for _, k := range skeys {
+			parseKey(k, "")
+		}
+	}
+	return comps
+}
+
+func pyprojectDeclaresDeps(raw string) bool {
+	inPoetry := false
+	for _, rawLine := range strings.Split(raw, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			inPoetry = strings.EqualFold(line, "[tool.poetry.dependencies]")
+			continue
+		}
+		if strings.HasPrefix(line, "dependencies = [") || strings.HasPrefix(line, "dependencies=[") {
+			return !strings.Contains(line, "[]")
+		}
+		if inPoetry {
+			if eq := strings.IndexByte(line, '='); eq > 0 {
+				pkg := strings.TrimSpace(line[:eq])
+				if !strings.EqualFold(pkg, "python") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func composerDeclaresDeps(raw string) bool {
+	var doc struct {
+		Require    map[string]string `json:"require"`
+		RequireDev map[string]string `json:"require-dev"`
+	}
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		return false
+	}
+	for k := range doc.Require {
+		low := strings.ToLower(k)
+		if low != "php" && !strings.HasPrefix(low, "ext-") && !strings.HasPrefix(low, "lib-") {
+			return true
+		}
+	}
+	return len(doc.RequireDev) > 0
+}
+
+func parseComposerLock(raw string, target string) []Component {
+	var doc struct {
+		Packages []struct {
+			Name    string   `json:"name"`
+			Version string   `json:"version"`
+			License []string `json:"license"`
+			Dist    struct {
+				Shasum string `json:"shasum"`
+			} `json:"dist"`
+		} `json:"packages"`
+		PackagesDev []struct {
+			Name    string   `json:"name"`
+			Version string   `json:"version"`
+			License []string `json:"license"`
+			Dist    struct {
+				Shasum string `json:"shasum"`
+			} `json:"dist"`
+		} `json:"packages-dev"`
+	}
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		return nil
+	}
+
+	var comps []Component
+	add := func(name, ver string, licenses []string, shasum string) {
+		if name == "" || ver == "" {
+			return
+		}
+		c := Component{
+			Ecosystem:    "Packagist",
+			Name:         name,
+			Version:      strings.TrimPrefix(ver, "v"),
+			PURL:         fmt.Sprintf("pkg:composer/%s@%s", name, strings.TrimPrefix(ver, "v")),
+			ManifestPath: target,
+			License:      strings.Join(licenses, " OR "),
+		}
+		if shasum != "" {
+			c.HashAlg = "SHA-1"
+			c.HashValue = shasum
+		}
+		comps = append(comps, c)
+	}
+	for _, p := range doc.Packages {
+		add(p.Name, p.Version, p.License, p.Dist.Shasum)
+	}
+	for _, p := range doc.PackagesDev {
+		add(p.Name, p.Version, p.License, p.Dist.Shasum)
+	}
+	return comps
+}
+
+func parsePomXML(raw string, target string, now time.Time) ([]Component, []schema.Finding) {
+	type xmlProp struct {
+		XMLName xml.Name
+		Value   string `xml:",chardata"`
+	}
+	type xmlDep struct {
+		GroupID    string `xml:"groupId"`
+		ArtifactID string `xml:"artifactId"`
+		Version    string `xml:"version"`
+	}
+	var proj struct {
+		Properties struct {
+			Entries []xmlProp `xml:",any"`
+		} `xml:"properties"`
+		Dependencies struct {
+			List []xmlDep `xml:"dependency"`
+		} `xml:"dependencies"`
+		DependencyManagement struct {
+			Dependencies struct {
+				List []xmlDep `xml:"dependency"`
+			} `xml:"dependencies"`
+		} `xml:"dependencyManagement"`
+	}
+	if err := xml.Unmarshal([]byte(raw), &proj); err != nil {
+		return nil, nil
+	}
+
+	props := make(map[string]string, len(proj.Properties.Entries))
+	for _, p := range proj.Properties.Entries {
+		props[p.XMLName.Local] = strings.TrimSpace(p.Value)
+	}
+	resolveProp := func(v string) string {
+		s := strings.TrimSpace(v)
+		if strings.HasPrefix(s, "${") && strings.HasSuffix(s, "}") {
+			if val, ok := props[s[2:len(s)-1]]; ok && val != "" {
+				return val
+			}
+		}
+		return s
+	}
+
+	allDeps := append([]xmlDep{}, proj.Dependencies.List...)
+	allDeps = append(allDeps, proj.DependencyManagement.Dependencies.List...)
+
+	var (
+		comps    []Component
+		findings []schema.Finding
+	)
+	for _, d := range allDeps {
+		g := strings.TrimSpace(d.GroupID)
+		a := strings.TrimSpace(d.ArtifactID)
+		v := resolveProp(d.Version)
+		if g == "" || a == "" || v == "" {
+			continue
+		}
+		up := strings.ToUpper(v)
+		if up == "LATEST" || up == "RELEASE" || strings.Contains(v, ",") || strings.Contains(v, "SNAPSHOT") {
+			findings = append(findings, schema.NewFinding(
+				"PIPE-103", "deps", schema.SeverityMedium,
+				"Unpinned Maven dependency version in pom.xml",
+				fmt.Sprintf("Maven artifact %s:%s uses mutable version spec %q.", g, a, v),
+				target,
+				map[string]any{"ecosystem": "Maven", "package": g + ":" + a, "version_spec": v, "standard": "SLSA Build L2"},
+				"Pin Maven dependency versions cleanly or manage releases through an immutable BOM.",
+				"D3-SBOM", fmt.Sprintf("maven-unpinned-%s-%s", g, a), now,
+			))
+			continue
+		}
+		if strings.HasPrefix(v, "${") {
+			continue
+		}
+		coord := g + ":" + a
+		comps = append(comps, Component{
+			Ecosystem:    "Maven",
+			Name:         coord,
+			Version:      v,
+			PURL:         fmt.Sprintf("pkg:maven/%s/%s@%s", g, a, v),
+			ManifestPath: target,
+		})
+	}
+	return comps, findings
+}
+
+// AuditLicenses inspects component SPDX license metadata against prohibited license family prefixes.
+func AuditLicenses(comps []Component, denied []string) []schema.Finding {
+	rules := denied
+	if len(rules) == 0 {
+		rules = DefaultDeniedLicenses
+	}
+	normDenied := make(map[string]struct{}, len(rules))
+	for _, r := range rules {
+		tok := licenseFamilyToken(r)
+		if tok != "" {
+			normDenied[tok] = struct{}{}
+		}
+	}
+
+	var findings []schema.Finding
+	now := time.Now().UTC()
+	for _, c := range comps {
+		if strings.TrimSpace(c.License) == "" {
+			continue
+		}
+		matched := ""
+		for _, part := range splitLicenseTokens(c.License) {
+			fam := licenseFamilyToken(part)
+			if _, banned := normDenied[fam]; banned {
+				matched = part
+				break
+			}
+		}
+		if matched == "" {
+			continue
+		}
+		findings = append(findings, schema.NewFinding(
+			"PIPE-105", "deps", schema.SeverityMedium,
+			fmt.Sprintf("Restricted license %q on dependency %s@%s", c.License, c.Name, c.Version),
+			fmt.Sprintf("Component %s (%s %s) declares license %q matching restricted policy family.", c.Name, c.Ecosystem, c.Version, c.License),
+			c.ManifestPath,
+			map[string]any{
+				"ecosystem": c.Ecosystem,
+				"package":   c.Name,
+				"version":   c.Version,
+				"license":   c.License,
+				"matched":   matched,
+				"standard":  "SPDX License Compliance",
+			},
+			"Review legal obligations for copyleft/restricted licenses or substitute a permissive dependency.",
+			"D3-SBOM",
+			fmt.Sprintf("lic-%s-%s-%s", c.Name, c.Version, matched),
+			now,
+		))
+	}
+	return findings
+}
+
+func splitLicenseTokens(raw string) []string {
+	return strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ' ' || r == ',' || r == ';' || r == '/' || r == '(' || r == ')' || r == '\t'
+	})
+}
+
+func licenseFamilyToken(token string) string {
+	low := strings.ToLower(strings.TrimSpace(token))
+	if low == "" || low == "or" || low == "and" || low == "with" {
+		return ""
+	}
+	var prefix strings.Builder
+	for _, r := range low {
+		if unicode.IsLetter(r) {
+			prefix.WriteRune(r)
+		} else {
+			break
+		}
+	}
+	fam := strings.TrimSuffix(prefix.String(), "v")
+	return fam
 }
 
 func parseRequirementsTxt(raw string, target string, now time.Time) ([]Component, []schema.Finding) {
@@ -528,7 +982,9 @@ func isIgnoredDepsDir(name string) bool {
 
 func isSupportedDepsFile(lowerBase string) bool {
 	switch lowerBase {
-	case "go.mod", "package.json", "package-lock.json", "cargo.toml", "cargo.lock", "requirements.txt":
+	case "go.mod", "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+		"cargo.toml", "cargo.lock", "requirements.txt", "pyproject.toml", "poetry.lock", "uv.lock",
+		"composer.json", "composer.lock", "pom.xml":
 		return true
 	default:
 		return false

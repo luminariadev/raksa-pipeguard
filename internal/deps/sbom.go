@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/luminariadev/raksa-pipeguard/internal/schema"
@@ -36,12 +37,22 @@ type cycloneRoot struct {
 }
 
 type cycloneComp struct {
-	Type    string        `json:"type"`
-	BOMRef  string        `json:"bom-ref"`
-	Name    string        `json:"name"`
-	Version string        `json:"version"`
-	PURL    string        `json:"purl"`
-	Hashes  []cycloneHash `json:"hashes,omitempty"`
+	Type     string                 `json:"type"`
+	BOMRef   string                 `json:"bom-ref"`
+	Name     string                 `json:"name"`
+	Version  string                 `json:"version"`
+	PURL     string                 `json:"purl"`
+	Hashes   []cycloneHash          `json:"hashes,omitempty"`
+	Licenses []cycloneLicenseChoice `json:"licenses,omitempty"`
+}
+
+type cycloneLicenseChoice struct {
+	License *cycloneLicense `json:"license,omitempty"`
+}
+
+type cycloneLicense struct {
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
 }
 
 type cycloneHash struct {
@@ -70,6 +81,13 @@ func GenerateCycloneDX(rootPath string, comps []Component) (string, error) {
 		}
 		if c.HashAlg != "" && c.HashValue != "" {
 			item.Hashes = []cycloneHash{{Alg: c.HashAlg, Content: c.HashValue}}
+		}
+		if lic := strings.TrimSpace(c.License); lic != "" {
+			if strings.ContainsAny(lic, " ()") {
+				item.Licenses = []cycloneLicenseChoice{{License: &cycloneLicense{Name: lic}}}
+			} else {
+				item.Licenses = []cycloneLicenseChoice{{License: &cycloneLicense{ID: lic}}}
+			}
 		}
 		outComps = append(outComps, item)
 	}

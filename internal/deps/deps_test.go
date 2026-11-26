@@ -114,11 +114,165 @@ func TestOfflineAndOnlineOSVAudit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	onlineHits, err := AuditDependencies(context.Background(), comps, OSVOptions{Online: true, BaseURL: srv.URL})
+	onlineHits, err := AuditDependencies(context.Background(), comps, OSVOptions{Online: true, BaseURL: srv.URL, NoCache: true})
 	if err != nil {
 		t.Fatalf("AuditDependencies online: %v", err)
 	}
 	if len(onlineHits) != 1 || onlineHits[0].RuleID != "PIPE-101" || onlineHits[0].Severity != "critical" {
 		t.Fatalf("expected 1 critical PIPE-101 online finding, got %+v", onlineHits)
+	}
+}
+
+func TestExtendedLockfilesLicensesAndOSVCache(t *testing.T) {
+	dir := t.TempDir()
+
+	yarnRaw := `# yarn lockfile v1
+
+"lodash@^4.17.20":
+  version "4.17.21"
+  integrity sha512-v123
+
+"@scope/widget@^1.0.0":
+  version "1.2.3"
+`
+	if err := os.WriteFile(filepath.Join(dir, "yarn.lock"), []byte(yarnRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pnpmRaw := `lockfileVersion: '9.0'
+packages:
+  chalk@5.3.0:
+    resolution: {integrity: sha512-pnpm}
+  /@types/node@20.11.0(undici@5.0.0):
+    resolution: {integrity: sha512-node}
+`
+	if err := os.WriteFile(filepath.Join(dir, "pnpm-lock.yaml"), []byte(pnpmRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	poetryRaw := `[[package]]
+name = "urllib3"
+version = "2.2.1"
+`
+	if err := os.WriteFile(filepath.Join(dir, "poetry.lock"), []byte(poetryRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uvRaw := `version = 1
+[[package]]
+name = "local-app"
+version = "0.1.0"
+source = { virtual = "." }
+
+[[package]]
+name = "httpx"
+version = "0.27.0"
+`
+	if err := os.WriteFile(filepath.Join(dir, "uv.lock"), []byte(uvRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	composerRaw := `{
+  "packages": [
+    {"name": "vendor/copyleft-lib", "version": "v1.4.2", "license": ["GPL-3.0-only"], "dist": {"shasum": "abc123"}},
+    {"name": "vendor/safe-lgpl", "version": "2.0.0", "license": ["LGPL-2.1-only"], "dist": {"shasum": "def456"}},
+    {"name": "vendor/permissive", "version": "3.1.0", "license": ["MIT"], "dist": {"shasum": "789"}}
+  ]
+}`
+	if err := os.WriteFile(filepath.Join(dir, "composer.lock"), []byte(composerRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pomRaw := `<project>
+  <properties><spring.version>6.1.5</spring.version></properties>
+  <dependencies>
+    <dependency><groupId>org.springframework</groupId><artifactId>spring-web</artifactId><version>${spring.version}</version></dependency>
+    <dependency><groupId>com.example</groupId><artifactId>floating-lib</artifactId><version>LATEST</version></dependency>
+  </dependencies>
+</project>`
+	if err := os.WriteFile(filepath.Join(dir, "pom.xml"), []byte(pomRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	comps, invFindings, err := InventoryFromPath(dir)
+	if err != nil {
+		t.Fatalf("InventoryFromPath extended: %v", err)
+	}
+
+	purls := make(map[string]bool)
+	for _, c := range comps {
+		purls[c.PURL] = true
+	}
+	for _, want := range []string{
+		"pkg:npm/lodash@4.17.21",
+		"pkg:npm/%40scope/widget@1.2.3",
+		"pkg:npm/chalk@5.3.0",
+		"pkg:npm/%40types/node@20.11.0",
+		"pkg:pypi/urllib3@2.2.1",
+		"pkg:pypi/httpx@0.27.0",
+		"pkg:composer/vendor/copyleft-lib@1.4.2",
+		"pkg:maven/org.springframework/spring-web@6.1.5",
+	} {
+		if !purls[want] {
+			t.Fatalf("missing expected PURL %q from %v", want, purls)
+		}
+	}
+	if purls["pkg:pypi/local-app@0.1.0"] {
+		t.Fatalf("local uv.lock workspace root should be skipped")
+	}
+	if len(invFindings) != 1 || invFindings[0].RuleID != "PIPE-103" {
+		t.Fatalf("expected 1 Maven LATEST PIPE-103 finding, got %+v", invFindings)
+	}
+
+	licFindings := AuditLicenses(comps, nil)
+	if len(licFindings) != 1 || licFindings[0].RuleID != "PIPE-105" || !strings.Contains(licFindings[0].Title, "copyleft-lib") {
+		t.Fatalf("expected single PIPE-105 on GPL-3.0-only (not LGPL or MIT), got %+v", licFindings)
+	}
+
+	bomJSON, err := GenerateCycloneDX(dir, comps)
+	if err != nil || !strings.Contains(bomJSON, `"GPL-3.0-only"`) {
+		t.Fatalf("expected CycloneDX SBOM to include license metadata, err=%v bom=%s", err, bomJSON)
+	}
+
+	// Parallel OSV detail fetch extracting fixed_version + disk TTL cache verification.
+	detailCalls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/querybatch":
+			_, _ = w.Write([]byte(`{"results":[{"vulns":[{"id":"GHSA-cache-0001"}]}]}`))
+		case "/v1/vulns/GHSA-cache-0001":
+			detailCalls++
+			_, _ = w.Write([]byte(`{
+				"id":"GHSA-cache-0001",
+				"summary":"Remote issue in mock package",
+				"database_specific":{"severity":"HIGH"},
+				"affected":[{"package":{"ecosystem":"npm","name":"chalk"},"ranges":[{"events":[{"introduced":"0"},{"fixed":"5.4.0"}]}]}]
+			}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cacheDir := filepath.Join(t.TempDir(), "osv-cache")
+	targetComp := []Component{{Ecosystem: "npm", Name: "chalk", Version: "5.3.0", PURL: "pkg:npm/chalk@5.3.0", ManifestPath: "file://pnpm-lock.yaml"}}
+
+	firstHits, err := AuditDependencies(context.Background(), targetComp, OSVOptions{
+		Online:   true,
+		BaseURL:  srv.URL,
+		CacheDir: cacheDir,
+	})
+	if err != nil || len(firstHits) != 1 || firstHits[0].Evidence["fixed_version"] != "5.4.0" {
+		t.Fatalf("first cached OSV lookup failed: hits=%+v err=%v", firstHits, err)
+	}
+	if detailCalls != 1 {
+		t.Fatalf("expected 1 HTTP detail call on cold cache, got %d", detailCalls)
+	}
+
+	secondHits, err := AuditDependencies(context.Background(), targetComp, OSVOptions{
+		Online:   true,
+		BaseURL:  srv.URL,
+		CacheDir: cacheDir,
+	})
+	if err != nil || len(secondHits) != 1 || secondHits[0].Evidence["fixed_version"] != "5.4.0" {
+		t.Fatalf("second cached OSV lookup failed: hits=%+v err=%v", secondHits, err)
+	}
+	if detailCalls != 1 {
+		t.Fatalf("expected cache hit with 0 extra HTTP detail calls, total=%d", detailCalls)
 	}
 }
